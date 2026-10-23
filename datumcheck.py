@@ -67,6 +67,11 @@ DEFAULT_PARCEL_ACRES = 1.0
 # covers another state or country is not reported as missing here.
 PROBE_BOX_DEGREES = 0.01
 
+# A point that moves less than this many degrees (about 0.1 mm) did not move.
+# Used only where the operation holds an optional grid, which PROJ skips
+# without a warning when the file is missing.
+UNMOVED_DEGREES = 1e-9
+
 # =============================================================================
 # End of CONFIGURATION.
 # =============================================================================
@@ -169,6 +174,30 @@ def is_null_op(steps, op_accuracy):
     if not datum:
         return False
     return all(is_null_step(s, op_accuracy) for s in datum)
+
+
+def optional_grids(steps):
+    """Names of the optional grids ("@name") that the datum steps hold.
+
+    A proj4 string such as +nadgrids=@conus lists grids by file name. PROJ
+    treats an "@" name as optional and, when no listed file exists, applies no
+    shift and says nothing. The name is a string, so is_null_step cannot see
+    that the step does nothing.
+    """
+    names = []
+    for step in steps:
+        if step.get("type") != "Transformation":
+            continue
+        for param in step.get("parameters") or []:
+            value = param.get("value")
+            if isinstance(value, str):
+                names.extend(n for n in value.split(",") if n.startswith("@"))
+    return names
+
+
+def unmoved(x, y, gx, gy):
+    """True when a geographic point came out where it went in."""
+    return abs(gx - x) < UNMOVED_DEGREES and abs(gy - y) < UNMOVED_DEGREES
 
 
 def better_missing(used_accuracy, unavailable):
@@ -311,12 +340,22 @@ def accuracy_text(accuracy):
     return "%g m" % accuracy
 
 
+def group_key(res):
+    """What makes two probes one report group: the operation, the verdict,
+    the better operations that are missing and the optional grids. Probes that
+    differ in any of these must not share the advice of the first one."""
+    return (res["desc"], res["verdict"],
+            tuple(op["name"] for op in better_missing(res["accuracy"],
+                                                      res["missing"])),
+            tuple(res.get("optional", ())))
+
+
 def group_probes(results):
-    """One group per distinct operation, in first-seen order, with a count."""
+    """One group per distinct group_key, in first-seen order, with a count."""
     groups = []
     index = {}
     for res in results:
-        key = res["desc"]
+        key = group_key(res)
         if key not in index:
             index[key] = len(groups)
             groups.append(dict(res, count=0))
@@ -331,8 +370,13 @@ def probe_lines(group):
         "  PROJ used  %s (declared accuracy %s)" % (
             ascii_text(group["desc"]), accuracy_text(group["accuracy"]))]
     better = better_missing(group["accuracy"], group["missing"])
+    if group.get("optional") and group["verdict"] == NULL_SHIFT:
+        lines.append("  the CRS names the optional grid(s) %s and the point "
+                     "did not move; PROJ skips a missing optional grid "
+                     "without a warning" % ascii_text(
+                         ", ".join(group["optional"])))
     if not better:
-        if group["verdict"] == NULL_SHIFT:
+        if group["verdict"] == NULL_SHIFT and not group.get("optional"):
             lines.append("  no more accurate operation is known to PROJ here; "
                          "a grid cannot fix this pair")
         return lines
@@ -381,6 +425,16 @@ def _import_pyproj():
     return pyproj
 
 
+def horizontal(crs):
+    """The horizontal part of a compound CRS, else the CRS itself.
+
+    A vertical unit change makes PROJ merge the datum step into one step with
+    no parameters, which hides a zero shift. This tool checks the horizontal
+    move only, so it asks PROJ for that move alone.
+    """
+    return crs.sub_crs_list[0] if crs.is_compound else crs
+
+
 def _op_facts(op):
     """Steps, accuracy and name of a PROJ operation."""
     data = op.to_json_dict()
@@ -416,13 +470,22 @@ def probe_one(pyproj, ctx, x, y):
         # One operation only: PROJ keeps no list of alternatives to report.
         op = ctx["tf"]
     steps, accuracy, desc = _op_facts(op)
-    if desc not in ctx["missing"]:
-        ctx["missing"][desc] = _unavailable(
-            pyproj, ctx["src"], ctx["dst"], ctx["to_lonlat"], x, y)
-    missing = ctx["missing"][desc]
+    # Looked up for every probe: the better operations depend on the position,
+    # and one operation name can cover regions with different grids.
+    missing = _unavailable(
+        pyproj, ctx["src"], ctx["dst"], ctx["to_lonlat"], x, y)
     null = is_null_op(steps, accuracy)
+    optional = optional_grids(steps)
+    if optional:
+        if not (ctx["src"].is_geographic and ctx["dst"].is_geographic):
+            raise ValueError(
+                "the operation holds the optional grid(s) %s and datumcheck "
+                "can tell whether such a grid was used only between two "
+                "geographic CRS. Use EPSG codes." % ", ".join(optional))
+        null = null or unmoved(x, y, gx, gy)
     return {"x": x, "y": y, "desc": desc, "accuracy": accuracy,
-            "missing": missing, "verdict": judge(null, accuracy, missing)}
+            "missing": missing, "optional": optional,
+            "verdict": judge(null, accuracy, missing)}
 
 
 def offset_ft(dst, expected, got):
@@ -462,8 +525,9 @@ def run_check(args, out):
         dst = pyproj.CRS.from_user_input(args.dst)
     except pyproj.exceptions.CRSError as exc:
         raise ValueError("cannot read a CRS: %s" % exc)
+    src, dst = horizontal(src), horizontal(dst)
     tf = pyproj.Transformer.from_crs(src, dst, always_xy=True)
-    ctx = {"src": src, "dst": dst, "tf": tf, "missing": {},
+    ctx = {"src": src, "dst": dst, "tf": tf,
            "to_lonlat": pyproj.Transformer.from_crs(
                src, "EPSG:4326", always_xy=True)}
 
@@ -486,7 +550,7 @@ def run_check(args, out):
     if emit:
         if code != EXIT_OK:
             report.append("refused to emit control values: this host did not "
-                          "use a full-accuracy operation")
+                          "use the best available operation")
             print("\n".join(report), file=sys.stderr)
             return code
         out.write("sx,sy,tx,ty\n")
@@ -781,6 +845,20 @@ def _self_test(tmp, user_dir):
           and exit_code([OK, DEGRADED]) == 3 and exit_code([OK]) == 0,
           "one null shift among the probes decides the exit code")
 
+    nad27 = step("Transformation from unknown to NAD83",
+                 ["@conus,@alaska,file.gsb"])
+    check(optional_grids([nad27, proj]) == ["@conus", "@alaska"],
+          "the optional grids of a datum step are the names that start with @")
+    check(optional_grids([grid, zero, proj]) == []
+          and optional_grids([step("x", [1.5, "@plain.gsb"], kind="Conversion")])
+          == [] and optional_grids([{"type": "Transformation"}]) == [],
+          "a required grid, a number, a conversion and a step with no "
+          "parameters hold no optional grid")
+    check(unmoved(-82.0, 29.0, -82.0, 29.000000000000004)
+          and not unmoved(-82.0, 29.0, -81.9998, 29.0)
+          and not unmoved(-82.0, 29.0, -82.0, 29.0002),
+          "a point that moved by 0.0002 degrees in either axis moved")
+
     # ---- input parsing
     check(finite_pair(1.0, 2.0) and not finite_pair(1.0, float("inf"))
           and not finite_pair(float("-inf"), 2.0)
@@ -901,6 +979,16 @@ def _self_test(tmp, user_dir):
           == ["op one", "op three"],
           "probes with the same verdict but different operations form "
           "separate groups")
+    # two probes of one operation, one degraded and one clean, are two groups
+    # whichever comes first
+    clean = dict(one, missing=[], verdict=OK)
+    check([g["verdict"] for g in group_probes([clean, one])] == [OK, DEGRADED]
+          and [g["verdict"] for g in group_probes([one, clean])]
+          == [DEGRADED, OK]
+          and [g["count"] for g in group_probes([one, clean, one])] == [2, 1],
+          "probes of one operation with different verdicts or missing grids "
+          "are separate groups, so the first one's advice is not reused  "
+          "<-- pinned defect")
     text = "\n".join(probe_lines(groups[0]))
     check("needs      us_noaa_FL.tif  https://cdn.example/x" in text
           and "install    projsync --file us_noaa_FL.tif" in text
@@ -912,6 +1000,15 @@ def _self_test(tmp, user_dir):
     check("a grid cannot fix" not in "\n".join(probe_lines(
         dict(groups[0], missing=[], verdict=OK))),
         "a clean group prints no grid advice")
+    opt = dict(groups[1], optional=["@conus", "@alaska"])
+    opt_text = "\n".join(probe_lines(opt))
+    check("optional grid(s) @conus, @alaska" in opt_text
+          and "did not move" in opt_text
+          and "a grid cannot fix" not in opt_text
+          and "optional grid" not in "\n".join(probe_lines(
+              dict(groups[0], optional=["@conus"]))),
+          "a null shift from a missing optional grid says so, and a clean "
+          "probe does not")
     off_cdn = [{"name": "a", "accuracy": 0.5, "grids": [
         {"short_name": "a.gsb", "url": "", "direct_download": False},
         {"short_name": "a.gsb", "url": "", "direct_download": False}]}]
@@ -1044,6 +1141,51 @@ def _self_test(tmp, user_dir):
     check(code == 0 and "2 probe(s)" in out,
           "two --point flags are two probes under one operation")
 
+    # one operation name can cover regions with different grid coverage: the
+    # lookup of the missing grids must follow the position of each probe
+    hi = ["--from", "EPSG:4152", "--to", "EPSG:4269"]
+    nihoa = ["--point", "-161.92", "23.06"]
+    oahu = ["--point", "-157.86", "21.31"]
+    codes = [run_cli(hi + pts)[0] for pts in
+             (oahu, nihoa, oahu + nihoa, nihoa + oahu)]
+    check(codes == [3, 0, 3, 3],
+          "Oahu alone is degraded, Nihoa alone is clean, and the pair exits 3 "
+          "in either order  <-- pinned defect")
+    code, out, err = run_cli(hi + nihoa + oahu)
+    check(out.count("probe(s)") == 2 and "us_noaa_hihpgn.tif" in out,
+          "the clean Nihoa probe and the degraded Oahu probe are reported "
+          "apart, with the grids for Oahu  <-- pinned defect")
+
+    # an optional grid that is not on the host is skipped without a warning
+    legacy = ("+proj=longlat +datum=NAD27 +nadgrids=@conus,@alaska,@ntv2_0.gsb,"
+              "@ntv1_can.dat +no_defs")
+    code, out, err = run_cli(["--from", legacy, "--to", "EPSG:4269",
+                              "--point", "-82", "29"])
+    check(code == 1 and "RESULT: NULL SHIFT (exit 1)" in out
+          and "optional grid(s) @conus" in out
+          and "a grid cannot fix" not in out,
+          "a proj4 NAD27 definition whose optional grids are missing does not "
+          "move the point and exits 1  <-- pinned defect")
+    code, out, err = run_cli(["--from", "+proj=utm +zone=17 +datum=NAD27 "
+                              "+nadgrids=@conus +no_defs", "--to", "EPSG:4269",
+                              "--point", "400000", "3200000"])
+    check(code == 2 and "optional grid(s) @conus" in err,
+          "an optional grid between a projected and a geographic CRS cannot "
+          "be judged and exits 2, not 0  <-- pinned defect")
+
+    # a vertical unit change must not hide the zero horizontal shift
+    code, out, err = run_cli(["--from", "EPSG:6438+5703", "--to",
+                              "EPSG:4326+6360", "--point", "600000", "1200000"])
+    plain = run_cli(["--from", "EPSG:6438+5703", "--to", "EPSG:4326+5703",
+                     "--point", "600000", "1200000"])[0]
+    check(code == 1 and plain == 1 and "RESULT: NULL SHIFT (exit 1)" in out,
+          "a compound CRS pair with a vertical unit change is judged on its "
+          "horizontal part and exits 1  <-- pinned defect")
+    check(horizontal(pyproj.CRS.from_user_input("EPSG:6438+5703")).to_epsg()
+          == 6438 and horizontal(pyproj.CRS.from_user_input("EPSG:6438"))
+          .to_epsg() == 6438,
+          "the horizontal part of a compound CRS is its first component")
+
     # a control file whose truth sits 30 ft east and 40 ft north of the result
     tf = pyproj.Transformer.from_crs("EPSG:2237", "EPSG:2883", always_xy=True)
     rows = ["sx,sy,tx,ty"]
@@ -1101,6 +1243,16 @@ def _self_test(tmp, user_dir):
     check(code == 0 and out.startswith("sx,sy,tx,ty\n")
           and out.count("\n") == 3,
           "--emit-control prints a header and one row per point")
+    pts_geo = write("ptsgeo.csv", "sx,sy\n-82,29\n")
+    code, out_geo, err = run_cli(["--from", "EPSG:4326", "--to", "EPSG:3857",
+                                  "--emit-control", pts_geo])
+    want = pyproj.Transformer.from_crs(
+        "EPSG:4326", "EPSG:3857", always_xy=True).transform(-82.0, 29.0)
+    cells = out_geo.split("\n")[1].split(",")
+    check(code == 0 and abs(float(cells[2]) - want[0]) < 1e-5
+          and abs(float(cells[3]) - want[1]) < 1e-5 and want[0] != -82.0,
+          "--emit-control writes the transformed target, not a copy of the "
+          "source  <-- pinned defect")
     emitted = write("emitted.csv", out)
     code, out2, err = run_cli(["--from", "EPSG:6440", "--to", "EPSG:6440",
                                "--control", emitted])
@@ -1183,14 +1335,27 @@ def _self_test(tmp, user_dir):
         proc = subprocess.run(
             [sys.executable, os.path.abspath(__file__)] + fl, env=env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        # a CRS taken from data can name a URL, and PROJ itself requests it
+        first = list(asked)
+        del asked[:]
+        subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "--from",
+             "+proj=longlat +ellps=GRS80 +nadgrids=http://127.0.0.1:%d/"
+             "evil.gsb +no_defs" % server.server_address[1], "--to",
+             "EPSG:4326", "--point", "-82", "29"], env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        evil = list(asked)
     finally:
         server.shutdown()
         server.server_close()
         thread.join()
-    check(proc.returncode in (0, 1, 2, 3) and len(asked) > 0
-          and all(path.endswith(".tif") for path in asked),
+    check(proc.returncode in (0, 1, 2, 3) and len(first) > 0
+          and all(path.endswith(".tif") for path in first),
           "with PROJ_NETWORK=ON the run asks only the endpoint for grid "
           "files, and the tool takes no URL from its input")
+    check("/evil.gsb" in evil,
+          "with PROJ_NETWORK=ON a URL inside a CRS string from data makes PROJ "
+          "request it, so do not feed untrusted CRS text to this tool")
     check(os.listdir(net_dir) == ["cache.db"],
           "with PROJ_NETWORK=ON PROJ writes cache.db to its user directory "
           "and nothing else is written")

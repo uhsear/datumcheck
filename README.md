@@ -11,7 +11,7 @@ It is not right. The pip wheel carries no datum grids, so PROJ could not use the
 needs one. It fell back to a zero translation, or to a "ballpark" offset that moves nothing.
 Every point landed about 1.6 feet from where the grid operation puts it. In the same run PROJ
 used two different fallbacks for two parts of the same layer. Older data is worse. A NAD27 layer
-that falls back lands 11 feet off, and a 640 acre section that moves 11 feet claims 1.6 acres
+that falls back lands 12 feet off, and a 640 acre section that moves 12 feet claims 1.5 acres
 that belong to its neighbours. Nobody sees this, because no step in the pipeline compares the
 result with anything.
 
@@ -21,7 +21,7 @@ result is.
 
 ```
 $ python datumcheck.py --self-test
-datumcheck self-test: temporary files only, no network, no credentials
+datumcheck self-test: temporary files and loopback only, no credentials
 --------------------------------------------------------------------
 PASS  1200/3937 of a metre is exactly one US survey foot
 PASS  one metre is 3.2808333 US survey feet
@@ -32,6 +32,10 @@ PASS  a prefix --hel of --help is refused  <-- pinned defect
 ...
 PASS  NAD83 to NAD83(2011) without grids is a null shift and exits 1
 ...
+PASS  Oahu alone is degraded, Nihoa alone is clean, and the pair exits 3 in either order  <-- pinned defect
+...
+PASS  a proj4 NAD27 definition whose optional grids are missing does not move the point and exits 1  <-- pinned defect
+...
 PASS  Florida West to North without grids is degraded and exits 3
 ...
 PASS  a control file 30 ft east and 40 ft north reports a 50.00 ftUS miss and 0.3078 acres
@@ -39,7 +43,7 @@ PASS  a control file 30 ft east and 40 ft north reports a 50.00 ftUS miss and 0.
 PASS  a host without the grids refuses to emit control values and writes nothing  <-- pinned defect
 ...
 --------------------------------------------------------------------
-103 assertions, 0 failed
+148 assertions, 0 failed
 ```
 
 ## What already exists
@@ -77,8 +81,9 @@ What they do not do, as far as I could test:
   has none on a host that lacks the grids.
 
 I searched GitHub with `gh search repos` for `datumcheck`, `projsync`, `ballpark`, `nadcon`,
-`datum-shift` and `proj-data`. No repository named `datumcheck` came back. The closest were
-`OSGeo/PROJ-data` (the grids) and `nc5ng/nadcon5-ng` (a NADCON5 tool). Neither gates a pipeline.
+`datum-shift` and `proj-data`. On 2026-10-23 the search for `datumcheck` returned only
+`uhsear/datumcheck`, which is this repository. The closest other results were `OSGeo/PROJ-data`
+(the grids) and `nc5ng/nadcon5-ng` (a NADCON5 tool). Neither gates a pipeline.
 
 ## Requirements
 
@@ -96,9 +101,9 @@ Tested on:
 
 | Host | Python | pyproj | PROJ | Self-test |
 |---|---|---|---|---|
-| Windows 11 | 3.13.2 (venv) | 3.8.0 | 9.8.1 | 103 assertions, 0 failed |
-| Windows 11 | 3.13 (`C:\Python313`) | 3.7.2 | 9.5.1 | 103 assertions, 0 failed |
-| Linux (Ubuntu) | 3.12.3 (venv) | 3.8.0 | 9.8.1 | 103 assertions, 0 failed |
+| Windows 11 | 3.13.2 (venv) | 3.8.0 | 9.8.1 | 148 assertions, 0 failed |
+| Windows 11 | 3.13 (`C:\Python313`) | 3.7.2 | 9.5.1 | 148 assertions, 0 failed |
+| Linux (Ubuntu) | 3.12.3 (venv) | 3.8.0 | 9.8.1 | 148 assertions, 0 failed |
 
 The count is the same on all three. Python 3.9 was used only to compile the file with
 `python -W error`; it has no pyproj, so the self-test did not run there.
@@ -112,7 +117,9 @@ python datumcheck.py --from EPSG:2236 --to EPSG:6438 --point 600000 1200000
 
 ## Usage
 
-Nothing in this tool writes a file. There is no `--apply`.
+The check writes no file. There is no `--apply`. Two things write outside the tool's control:
+`--self-test` puts CSV fixtures in a temporary directory that it removes, and PROJ itself creates
+`cache.db` in its user directory when `PROJ_NETWORK=ON`.
 
 ```
 python datumcheck.py --from EPSG:2236 --to EPSG:6438 --control truth.csv
@@ -125,7 +132,7 @@ python datumcheck.py --from EPSG:2236 --to EPSG:6438 --emit-control points.csv >
 | `--to CRS` | none | Target CRS. Required. |
 | `--point X Y` | centre of both areas of use | A probe point in source CRS units. Two numbers with a space between. Repeat the flag for more points. |
 | `--control CSV` | none | Known-good coordinates. Columns `sx,sy,tx,ty`. Adds the miss in feet and acres. The `sx,sy` values are the probes when you pass no `--point`. |
-| `--emit-control CSV` | none | Read points (columns `sx,sy`) and print control rows to standard output. Refuses unless this host used a full-accuracy operation. |
+| `--emit-control CSV` | none | Read points (columns `sx,sy`) and print control rows to standard output. Refuses unless this host used the best available operation (exit 0). |
 | `--parcel-acres N` | `1.0` | Parcel size for the acres figure. |
 | `--self-test` | off | Run the assertions and exit. |
 
@@ -140,13 +147,14 @@ are all refused with exit 64.
 | Code | Meaning |
 |---|---|
 | 0 | PROJ used a real operation at every probe. |
-| 1 | PROJ used a null-shift operation at one probe or more. |
+| 1 | PROJ used a null-shift operation at one probe or more, or skipped a missing optional grid (below). `--self-test` also exits 1 when an assertion fails. |
 | 2 | The check could not run: pyproj missing or old, unknown CRS, unreadable or bad CSV, or a point PROJ cannot transform. |
 | 3 | The operation is not a null shift, but a more accurate one needs grids this host lacks. |
 | 64 | Usage error, including an abbreviated or unknown flag. |
 | 70 | A fault in the tool. It is never a finding about your data. |
 
-If a probe is 1 and another is 3, the run exits 1.
+If a probe is 1 and another is 3, the run exits 1. Code 3 is not code 1, so a gate that tests only
+for 1 passes the NAD27 fallback that lands about 12 feet off. Treat any non-zero code as a failure.
 
 ## What counts as a null shift
 
@@ -168,8 +176,24 @@ datum seen twice, and a zero is correct there. The self-test pins this with a re
 
 PROJ chooses the operation for each point from the point's position. Its documentation says the
 operation listed first is not always the one used. So the tool transforms each probe, then asks.
-One lookup of the unavailable operations runs for each distinct operation, around the first probe
-that used it, in a box of 0.01 degrees.
+The lookup of the unavailable operations runs for every probe, in a box of 0.01 degrees around it,
+because one operation name can cover regions with different grids. At Oahu, `EPSG:4152` to
+`EPSG:4269` needs two missing grids and exits 3. At Nihoa the same operation name needs none and
+exits 0. The self-test pins that the pair exits 3 in either order. The lookup costs about 10 ms
+per probe: a 200 row file took 2.2 seconds.
+
+A proj4 string can name its grids, as in `+nadgrids=@conus,@alaska`. PROJ treats a grid with a
+leading `@` as optional and does not complain when it is missing
+(<https://proj.org/en/stable/operations/transformations/hgridshift.html>). It applies no shift. The
+step holds a file name, not a zero, so the zero test above cannot see it. When the operation holds
+an optional grid, datumcheck checks whether the point moved. A point that moved less than
+0.000000001 degrees is a null shift and exits 1. This check works between two geographic CRS only.
+With a projected CRS on either side the run exits 2, because it cannot tell. Use EPSG codes.
+
+A compound CRS, such as `EPSG:6438+5703`, is reduced to its horizontal part before the check. A
+change of vertical unit makes PROJ merge the datum step into one step with no parameters, which
+hid a zero shift. `EPSG:6438+5703` to `EPSG:4326+6360` now exits 1, the same as without the
+vertical part.
 
 ## Error in feet and acres
 
@@ -210,12 +234,14 @@ RESULT: NULL SHIFT (exit 1)
 The first point used a zero translation. The other two used a ballpark offset. The report groups
 the probes by operation, so the difference shows.
 
-Results for two pairs, all on synthetic points, all measured:
+Results for two pairs, all measured. Both use the three synthetic points above (600000 1200000,
+610000 1210000 and 620000 1220000, read in each pair's own zone), and the last column adds
+`--parcel-acres 640`:
 
 | Pair | Host | Exit | Worst miss | Acres, 1 acre parcel | Acres, 640 acre parcel |
 |---|---|---|---|---|---|
 | NAD83 to NAD83(2011), Florida East ftUS (`2236` to `6438`) | Linux, no grids | 1 | 1.59 ftUS | 0.0096 | not run |
-| NAD27 to NAD83, Florida North ftUS (`26760` to `2238`) | Linux, no grids | 3 | 10.83 ftUS | 0.0630 | 1.6100 |
+| NAD27 to NAD83, Florida North ftUS (`26760` to `2238`) | Linux, no grids | 3 | 12.27 ftUS | 0.0600 | 1.5198 |
 | both | Windows, grids installed | 0 | 0.00 ftUS | 0.0000 | not run |
 
 The Windows rows prove the control file is sound: with the grids, PROJ reproduces its own truth.
@@ -240,24 +266,76 @@ chain holds real translations.
 
 - Probes are samples. A layer that spans two areas of use can use a different operation between
   your probes. Pass `--point` for each corner, or pass a control file with a spread of points.
+- Probes that share an operation but differ in verdict or in missing grids are reported as separate
+  groups, so the advice of one probe is never reused for another.
 - The default probe is the centre of the overlap of the two CRS areas of use. For a CRS pair that
   spans a continent it may sit far from your data.
-- datumcheck makes no network call. PROJ's own network mode (`PROJ_NETWORK=ON`) is outside it and
-  was not exercised here. If you enable it, PROJ may fetch grids and the verdict will change.
+- datumcheck makes no network call of its own. PROJ's network mode (`PROJ_NETWORK=ON`) is outside
+  it. The self-test runs the tool once with it on, against a stub `http.server` on 127.0.0.1 that
+  answers 404 to every request. PROJ asked the stub only for `.tif` grid files and wrote `cache.db`.
+  No grid was ever fetched, so the self-test does not show what a real fetch changes. If you enable
+  network mode on a real host, PROJ may fetch grids and the verdict will change.
+- A CRS definition taken from untrusted data can make PROJ call out when network mode is on. The
+  self-test passes `+nadgrids=http://127.0.0.1:PORT/evil.gsb` and the stub receives the request.
+  Do not feed CRS text you do not trust to this tool with `PROJ_NETWORK=ON`.
 - Control values are only as good as their source. Control made on a host that also fell back is
   refused by `--emit-control`.
-- Horizontal only. A vertical datum is not checked.
+- Horizontal only. A vertical datum is not checked. A compound CRS is reduced to its horizontal
+  part.
+- Exit 0 means only that PROJ used no null-shift operation and knows of no better one that is
+  missing. It never means that the control file agrees. With a control file the miss is reported
+  but never gated: a control row 50 ft off still prints `worst miss 49.95 ftUS` and exits 0 on a
+  host with the grids. This holds for a bad control file too, such as swapped columns.
+- The error in feet and acres appears only when you pass `--control` (or an emitted control file).
+  Without ground truth the report shows only PROJ's declared accuracy in metres.
+- A gated NAD83 or NAD83(2011) to WGS 84 move, and ETRS89 to WGS 84, can never exit 0. EPSG defines
+  those operations as three zero translations and PROJ offers nothing better, so the check exits 1
+  with grids or without them (measured for `EPSG:6318` to `EPSG:4326`, both ways). There is no flag
+  to accept this.
+- The probe takes X first (longitude first for a geographic source). A latitude-first point such
+  as `--point 29.2 -82` is not rejected and probes the wrong place.
+- The default probe is the centre of the overlap of the two areas of use. For `EPSG:4269` to
+  `EPSG:4326` that is 50.685 N, 110.365 W, which lies in Canada. Pass `--point` for your own data.
+- `--emit-control` writes `%.6f`. On a geographic target that rounds by about 0.2 ftUS, so reading
+  an emitted file back with `--control` shows a small non-zero miss (0.19 ftUS for `EPSG:6318`).
+  The zero-miss round trip holds for projected targets only.
+- A control file with a header column twice (`sx,sy,tx,ty,sx`) takes the last value of that column.
+  A row with more cells than the header drops the extra cells. Check your header yourself.
+- A geographic target measured against control values in projected units prints `worst miss nan
+  ftUS` and a worst displacement of the whole parcel. Give control values in the target CRS units,
+  X (longitude) first.
+- Control, point and emit files must be UTF-8, and a byte order mark is accepted. A file in
+  a legacy code page, such as cp1252 with an accented letter, stops the run with exit 2. A header
+  such as `sx, sy`, with a space after the comma, stops the run with a missing-column error.
+- In Windows PowerShell 5.1, `--emit-control pts.csv > truth.csv` writes UTF-16, and the next
+  `--control` run exits 2 with a UTF-8 decode error on byte 0xff. Use `| Out-File -Encoding
+  ascii` or run the command in cmd.exe.
+- A field larger than 128 KiB in a control or point file makes the csv module raise an error that
+  the tool does not catch as bad input. It exits 70, not 2.
+- A fault inside the check that raises `ValueError`, `RuntimeError` or `OSError` is reported as exit
+  2, so it cannot be told apart from bad input.
+- An absurd `--parcel-acres`, such as `1e300`, loses precision: the area minus the overlap cancels
+  and the report prints `0.0000 acres` for a miss of 49.95 ftUS.
+- The whole control or emit file is read into memory, and each row costs one PROJ transform and one
+  lookup. A 200 row file took 2.2 seconds. A file of millions of rows was not tried.
 - It does not test ArcGIS Pro, ArcGIS Server or any Esri geoprocessing. Those use their own
   transformation engine. It checks the PROJ stack that pyproj, geopandas and GDAL builds use.
-- The self-test hides the grids of the host by setting `PROJ_USER_WRITABLE_DIRECTORY` before PROJ
-  loads. PROJ developers call this variable "for testing purposes only", and it is not on the
-  official environment variable page. If a future PROJ drops it, the self-test fails on its
-  isolation check instead of passing with grids present.
+- The self-test hides only the grids in PROJ's user directory, by setting
+  `PROJ_USER_WRITABLE_DIRECTORY` before PROJ loads. PROJ developers call this variable "for testing
+  purposes only", and it is not on the official environment variable page. If a future PROJ drops
+  it, the self-test fails on its isolation check instead of passing with grids present. Grids
+  in PROJ's data directory stay visible. With the data directory pointed at a folder that holds
+  grids (a conda install with `proj-data`), 11 assertions failed on this run. The check itself is
+  unaffected.
+- The self-test's `PROJ_NETWORK=ON` assertions fail when an HTTP proxy variable such as
+  `http_proxy` is set without a 127.0.0.1 `no_proxy` entry, because libcurl sends the loopback
+  request to the proxy. Measured with `http_proxy=http://127.0.0.1:9`: 2 assertions failed.
 - `only_best` behaviour differs between PROJ 9.5.1 and 9.8.1 (above). The self-test accepts both.
-- Branch coverage is 100 percent (591 statements, 120 branches) on Windows and on Linux, from
-  `coverage run --branch datumcheck.py --self-test`. No line is excluded and no line needs a
-  network. Windows and Linux run the same 103 assertions because the real PROJ part runs on every
-  host, with the grids hidden.
+- Branch coverage is 100 percent (743 statements, 130 branches, coverage 7.16.1 on the Windows
+  venv), from `coverage run --branch datumcheck.py --self-test`. No line is excluded. The network
+  lines run against the loopback stub. The Windows venv, `C:\Python313` and Linux all run the same
+  148 assertions, because the real PROJ part runs on every host with the grids hidden. Linux
+  coverage was not measured.
 
 ## Sources checked
 
@@ -273,6 +351,9 @@ chain holds real translations.
 - Search order of grid directories, the Windows and Linux user-writable directory:
   <https://proj.org/en/stable/resource_files.html>
 - `PROJ_NETWORK`: <https://proj.org/en/stable/usage/environmentvars.html>
+- Optional grids, the `@` prefix:
+  <https://proj.org/en/stable/operations/transformations/hgridshift.html> and
+  <https://proj.org/en/stable/usage/transformation.html>
 - `PROJ_USER_WRITABLE_DIRECTORY`, "for testing purposes only":
   <https://lists.osgeo.org/pipermail/proj/2020-July/009709.html>
 - Background on the US survey foot (the 1200/3937 ratio is checked against `proj.db` by the self-test):
