@@ -18,8 +18,11 @@ acres of a parcel that moved that far.
     python datumcheck.py --from EPSG:2237 --to EPSG:2883 --control truth.csv
     python datumcheck.py --from EPSG:2237 --to EPSG:2883 --emit-control pts.csv
 
-It never writes a file. --emit-control prints to standard output, so a host
-that has the grids can hand the truth to a host that has not.
+The check writes no file. --emit-control prints to standard output, so a host
+that has the grids can hand the truth to a host that has not. Two things write
+outside this tool's control: --self-test puts CSV fixtures in a temporary
+directory that it removes, and PROJ itself creates cache.db in its user
+directory when PROJ_NETWORK=ON.
 
 Exit codes: 0 no problem found, 1 a null-shift operation was used, 2 the check
 could not run, 3 a more accurate operation exists but its grids are missing,
@@ -31,13 +34,16 @@ from __future__ import print_function
 import argparse
 import contextlib
 import csv
+import http.server
 import importlib.util
 import io
 import math
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
+import threading
 import traceback
 import types
 import warnings
@@ -91,6 +97,15 @@ def metres_to_ftus(metres):
     return metres / METRES_PER_FTUS
 
 
+def usable_parcel_acres(acres):
+    """True for a positive size whose area in square feet is a finite number.
+
+    nan, zero, a negative size and infinity fail. So does a size so large that
+    its area overflows to infinity, which would print as nan acres.
+    """
+    return 0 < acres * SQFT_PER_ACRE < math.inf
+
+
 def displaced_acres(parcel_acres, dx_ft, dy_ft):
     """Acres of a square parcel that fall outside its true position.
 
@@ -99,7 +114,7 @@ def displaced_acres(parcel_acres, dx_ft, dy_ft):
     ground that is now claimed wrongly. A move of one side or more displaces
     the whole parcel.
     """
-    if not parcel_acres > 0 or math.isinf(parcel_acres):
+    if not usable_parcel_acres(parcel_acres):
         raise ValueError("the parcel size must be a positive number of acres")
     area = parcel_acres * SQFT_PER_ACRE
     side = math.sqrt(area)
@@ -190,9 +205,14 @@ def exit_code(verdicts):
     return EXIT_OK
 
 
+def finite_pair(a, b):
+    """True when both numbers are finite."""
+    return math.isfinite(a) and math.isfinite(b)
+
+
 def check_point(x, y):
     """Return (x, y) when both are finite numbers."""
-    if not (math.isfinite(x) and math.isfinite(y)):
+    if not finite_pair(x, y):
         raise ValueError("a point must be finite, got %r %r" % (x, y))
     return x, y
 
@@ -234,7 +254,8 @@ def area_centre(bounds_a, bounds_b):
 
     A box whose west is greater than its east crosses the antimeridian. Its
     east is unwrapped by 360 degrees, and the second box is tried at three
-    offsets.
+    offsets. When two boxes overlap in two places, the wider overlap wins; the
+    first one found wins a tie.
     """
     for bounds in (bounds_a, bounds_b):
         if bounds is None:
@@ -243,13 +264,39 @@ def area_centre(bounds_a, bounds_b):
     east_b = bounds_b[2] + (360.0 if bounds_b[0] > bounds_b[2] else 0.0)
     south = max(bounds_a[1], bounds_b[1])
     north = min(bounds_a[3], bounds_b[3])
+    best = None
     for shift in (0.0, 360.0, -360.0):
         west = max(bounds_a[0], bounds_b[0] + shift)
         east = min(east_a, east_b + shift)
-        if west < east and south < north:
-            lon = (west + east) / 2.0
-            return ((lon + 180.0) % 360.0) - 180.0, (south + north) / 2.0
-    raise ValueError("the two CRS areas of use do not overlap; pass --point")
+        if west < east and south < north and (
+                best is None or east - west > best[1] - best[0]):
+            best = (west, east)
+    if best is None:
+        raise ValueError("the two CRS areas of use do not overlap; pass "
+                         "--point")
+    lon = (best[0] + best[1]) / 2.0
+    return ((lon + 180.0) % 360.0) - 180.0, (south + north) / 2.0
+
+
+def probe_box(lon, lat, half):
+    """A (west, south, east, north) box of half-width half around a point,
+    held inside the longitude and latitude limits of the globe."""
+    return (max(-180.0, lon - half), max(-90.0, lat - half),
+            min(180.0, lon + half), min(90.0, lat + half))
+
+
+def collect_points(explicit, control, emit):
+    """Every point to probe: the --point values, then the rows of the control
+    file or the emit file. PROJ picks the operation from the position, so the
+    rows that are scored or written are probed too, not only --point."""
+    return (list(explicit) + [(r[0], r[1]) for r in control]
+            + [(r[0], r[1]) for r in emit])
+
+
+def report_header(src, dst):
+    """The first report line. CRS text can hold any character; a console may
+    not print it."""
+    return "datumcheck: %s -> %s" % (ascii_text(src), ascii_text(dst))
 
 
 def ascii_text(text):
@@ -343,10 +390,8 @@ def _op_facts(op):
 def _unavailable(pyproj, src, dst, to_lonlat, x, y):
     """Operations around a probe that PROJ knows but cannot use."""
     lon, lat = to_lonlat.transform(x, y)
-    box = PROBE_BOX_DEGREES
     area = pyproj.transformer.AreaOfInterest(
-        max(-180.0, lon - box), max(-90.0, lat - box),
-        min(180.0, lon + box), min(90.0, lat + box))
+        *probe_box(lon, lat, PROBE_BOX_DEGREES))
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         group = pyproj.transformer.TransformerGroup(
@@ -362,7 +407,7 @@ def _unavailable(pyproj, src, dst, to_lonlat, x, y):
 def probe_one(pyproj, ctx, x, y):
     """Transform one point and judge the operation PROJ used for it."""
     gx, gy = ctx["tf"].transform(x, y)
-    if not (math.isfinite(gx) and math.isfinite(gy)):
+    if not finite_pair(gx, gy):
         raise ValueError("PROJ returned no coordinate for %r, %r. The point "
                          "is outside what the source CRS supports." % (x, y))
     try:
@@ -426,17 +471,15 @@ def run_check(args, out):
         if args.control else []
     emit = parse_rows(read_text(args.emit_control), POINT_COLUMNS) \
         if args.emit_control else []
-    points = [check_point(x, y) for x, y in args.point or []]
-    if not points:
-        points = [(r[0], r[1]) for r in control] + \
-                 [(r[0], r[1]) for r in emit]
+    points = collect_points(
+        [check_point(x, y) for x, y in args.point or []], control, emit)
     if not points:
         to_src = pyproj.Transformer.from_crs("EPSG:4326", src, always_xy=True)
         points = [default_probe(src, dst, to_src)]
 
     results = [probe_one(pyproj, ctx, x, y) for x, y in points]
     code = exit_code([r["verdict"] for r in results])
-    report = ["datumcheck: %s -> %s" % (args.src, args.dst)]
+    report = [report_header(args.src, args.dst)]
     for group in group_probes(results):
         report.extend(probe_lines(group))
 
@@ -455,11 +498,8 @@ def run_check(args, out):
     if control:
         misses = []
         for sx, sy, tx, ty in control:
-            got = tf.transform(sx, sy)
-            if not (math.isfinite(got[0]) and math.isfinite(got[1])):
-                raise ValueError("PROJ returned no coordinate for control "
-                                 "row %r, %r" % (sx, sy))
-            misses.append(offset_ft(dst, (tx, ty), got))
+            # Every control row was probed above, so its result is finite.
+            misses.append(offset_ft(dst, (tx, ty), tf.transform(sx, sy)))
         report.append(control_line(
             summarize_misses(misses, args.parcel_acres)))
     report.append("RESULT: %s (exit %d)" % (
@@ -476,7 +516,7 @@ def _parse(argv):
         prog="datumcheck.py",
         description="Exit non-zero when PROJ moves data with a null-shift "
                     "operation. Reports the error in US survey feet and acres.",
-        epilog="Never writes a file. Needs pyproj.",
+        epilog="The check writes no file. Needs pyproj.",
         allow_abbrev=False,
     )
     ap.add_argument("--from", dest="src", metavar="CRS",
@@ -532,7 +572,7 @@ def _run(argv):
         print("error: --control and --emit-control cannot be used together.",
               file=sys.stderr)
         return EXIT_USAGE
-    if not args.parcel_acres > 0 or math.isinf(args.parcel_acres):
+    if not usable_parcel_acres(args.parcel_acres):
         print("error: --parcel-acres must be a positive number.",
               file=sys.stderr)
         return EXIT_USAGE
@@ -572,7 +612,8 @@ def self_test():
 
 def _self_test(tmp, user_dir):
     """Assertions over the decision core, then over real PROJ with no grids.
-    No network, no credentials. The only files are the ones under tmp."""
+    The only network is a stub server on 127.0.0.1, no credentials. The only
+    files are the ones under tmp."""
     passed = [0]
     failed = []
 
@@ -614,7 +655,7 @@ def _self_test(tmp, user_dir):
     def listing():
         return sorted(os.listdir(tmp))
 
-    print("datumcheck self-test: temporary files only, no network, no "
+    print("datumcheck self-test: temporary files and loopback only, no "
           "credentials")
     print("-" * 68)
 
@@ -646,6 +687,17 @@ def _self_test(tmp, user_dir):
            "a parcel of nan acres is refused  <-- pinned defect")
     raises(lambda: displaced_acres(float("inf"), 1.0, 1.0),
            "a parcel of infinite acres is refused")
+    raises(lambda: displaced_acres(1e305, 1.0, 1.0),
+           "a parcel whose area overflows is refused, not printed as nan "
+           "acres  <-- pinned defect")
+    check(usable_parcel_acres(1.0) and usable_parcel_acres(1e-5)
+          and not usable_parcel_acres(-1.0)
+          and not usable_parcel_acres(1e305),
+          "a parcel size is usable when it is positive and its area is "
+          "finite")
+    check(abs(displaced_acres(1e-5, 0.3, 0.0) * 43560.0 - 0.198) < 1e-9
+          and abs(displaced_acres(1e-5, 0.0, 0.3) * 43560.0 - 0.198) < 1e-9,
+          "a parcel smaller than a square foot displaces its true share")
     check(abs(miss_ft(30.0, 40.0) - 50.0) < 1e-12,
           "a 30 and 40 foot offset is a 50 foot miss")
     summary = summarize_misses([(30.0, 40.0), (0.0, 0.0)], 1.0)
@@ -681,10 +733,17 @@ def _self_test(tmp, user_dir):
     check(not is_null_step({"type": "Transformation", "name": "x"}, 1.0),
           "a transformation with no parameters is not called null")
     check(not is_null_step(step("x", [0, None]), 1.0)
-          and not is_null_step(step("x", [0, True]), 1.0),
+          and not is_null_step(step("x", [0, True]), 1.0)
+          and not is_null_step(step("x", [0, False]), 1.0),
           "a parameter that is not a number is never read as zero")
     check(not is_null_step(step("x", [0, 0, 0.001]), 1.0),
           "one non-zero parameter makes the step real")
+    check(not is_null_step(step("x", [-1.0, -2.0, -3.0]), 1.0)
+          and not is_null_step(step("x", [1.0, 2.0, 3.0]), 1.0),
+          "translations that are all negative, or all positive, are real")
+    check(is_null_step(zero, -1.0) and is_null_step(zero, 0.5),
+          "a zero translation of unknown or sub-metre accuracy is still a "
+          "null shift")
     check(is_null_op([proj, zero, proj], 1.0),
           "an operation whose only datum step is null is null")
     check(is_null_op([zero, ballpark], 1.0),
@@ -705,6 +764,14 @@ def _self_test(tmp, user_dir):
           "against an unknown accuracy every known accuracy is better")
     check(better_missing(0.01, unavailable) == [],
           "an unavailable operation that is less accurate is ignored")
+    check(better_missing(5.0, [{"name": "n", "grids": []}]) == [],
+          "an unavailable operation with no stated accuracy is ignored")
+    exact = [{"name": "e", "accuracy": 0.0, "grids": []}]
+    check(better_missing(5.0, exact) == exact
+          and better_missing(-1.0, exact) == exact
+          and better_missing(0.0, exact) == [],
+          "an unavailable operation of accuracy 0 beats any worse operation "
+          "and never beats another exact one")
     check(judge(True, 1.0, []) == NULL_SHIFT
           and judge(False, 5.0, unavailable) == DEGRADED
           and judge(False, 0.05, unavailable) == OK
@@ -715,6 +782,11 @@ def _self_test(tmp, user_dir):
           "one null shift among the probes decides the exit code")
 
     # ---- input parsing
+    check(finite_pair(1.0, 2.0) and not finite_pair(1.0, float("inf"))
+          and not finite_pair(float("-inf"), 2.0)
+          and not finite_pair(float("nan"), 2.0)
+          and not finite_pair(1.0, float("nan")),
+          "a pair is finite only when both numbers are")
     check(check_point(-82.0, 29.2) == (-82.0, 29.2),
           "a finite point passes")
     raises(lambda: check_point(1.0, float("nan")),
@@ -730,6 +802,11 @@ def _self_test(tmp, user_dir):
            "a header without the column is refused")
     raises(lambda: parse_rows("sx,sy\n", POINT_COLUMNS),
            "a header with no rows is refused")
+    try:
+        parse_rows("", POINT_COLUMNS)
+    except ValueError as exc:
+        check("it has no columns" in str(exc),
+              "an empty file says it has no columns")
     raises(lambda: parse_rows("", POINT_COLUMNS),
            "an empty file is refused")
     raises(lambda: parse_rows("sx,sy\n1,2\n3,abc\n", POINT_COLUMNS),
@@ -754,10 +831,60 @@ def _self_test(tmp, user_dir):
           "<-- pinned defect")
     raises(lambda: area_centre((0, 0, 1, 1), (5, 5, 6, 6)),
            "two areas of use that do not overlap are refused")
+    raises(lambda: area_centre((0, 0, 1, 1), (1, 0, 2, 1)),
+           "two areas of use that only touch along a meridian are refused")
+    raises(lambda: area_centre((0, 0, 1, 1), (0, 1, 1, 2)),
+           "two areas of use that only touch along a parallel are refused")
+    wide = area_centre((167.65, 14.92, -47.74, 86.46), (-180, -90, 180, 90))
+    check(abs(wide[0] + 113.87) < 0.01 and abs(wide[1] - 50.69) < 0.01,
+          "a continent box over the antimeridian is centred in its wider "
+          "overlap with the globe, not in the Bering Sea sliver  "
+          "<-- pinned defect")
+    check(area_centre((170, 0, -170, 10), (-180, 0, 180, 10))[0] == 175.0,
+          "when two overlaps are as wide as each other the first one wins")
+    check(area_centre((150, 0, -170, 10), (-180, 0, 180, 10))[0] == 165.0,
+          "the first overlap is kept when a later one is narrower")
+    check(area_centre((20, 0, -10, 50), (-180, -90, 180, 90))
+          == (-95.0, 25.0)
+          and area_centre((-180, -90, 180, 90), (20, 0, -10, 50))
+          == (-95.0, 25.0),
+          "a box with west east of its east crosses the antimeridian, "
+          "whatever its north is, in either argument")
+    here = types.SimpleNamespace(area_of_use=types.SimpleNamespace(
+        west=-90.0, south=20.0, east=-70.0, north=40.0))
+    there = types.SimpleNamespace(area_of_use=types.SimpleNamespace(
+        west=-80.0, south=30.0, east=-60.0, north=50.0))
+    nowhere = types.SimpleNamespace(area_of_use=None)
+    to_src = types.SimpleNamespace(transform=lambda lon, lat: (lon * 2, lat * 3))
+    check(default_probe(here, there, to_src) == (-150.0, 105.0),
+          "the default probe is the overlap of the source and the target "
+          "areas of use, converted to source units")
+    raises(lambda: default_probe(here, nowhere, to_src),
+           "a CRS without an area of use cannot give a default probe")
+    check(probe_box(10.0, 20.0, 0.5) == (9.5, 19.5, 10.5, 20.5),
+          "a probe box is the point plus and minus the half width")
+    check(probe_box(-179.75, -89.75, 0.5) == (-180.0, -90.0, -179.25, -89.25)
+          and probe_box(179.75, 89.75, 0.5) == (179.25, 89.25, 180.0, 90.0),
+          "a probe box never leaves the globe")
+    edge = probe_box(0.0, 0.0, PROBE_BOX_DEGREES)
+    check(0.0 < edge[2] - edge[0] < 0.1 and 0.0 < edge[3] - edge[1] < 0.1,
+          "the probe box is under a tenth of a degree wide, so another "
+          "region's grids are not asked about")
+    check(collect_points([(1.0, 2.0)], [(3.0, 4.0, 5.0, 6.0)], [])
+          == [(1.0, 2.0), (3.0, 4.0)]
+          and collect_points([], [], [(7.0, 8.0)]) == [(7.0, 8.0)]
+          and collect_points([], [], []) == [],
+          "the control and emit rows are probed as well as the --point "
+          "values  <-- pinned defect")
+    check(report_header("a\u03b1", "EPSG:4326")
+          == "datumcheck: a? -> EPSG:4326",
+          "the report header prints ASCII whatever the CRS text holds  "
+          "<-- pinned defect")
     check(ascii_text("R\xe9seau") == "R?seau",
           "a name with an accent prints as ASCII")
-    check(accuracy_text(-1.0) == "unknown" and accuracy_text(0.05) == "0.05 m",
-          "an unknown accuracy prints as unknown")
+    check(accuracy_text(-1.0) == "unknown" and accuracy_text(0.05) == "0.05 m"
+          and accuracy_text(0.0) == "0 m",
+          "an unknown accuracy prints as unknown and an exact one as 0 m")
 
     # ---- the report
     one = {"x": 1.0, "y": 2.0, "desc": "op one", "accuracy": 5.0,
@@ -769,6 +896,11 @@ def _self_test(tmp, user_dir):
     check([g["count"] for g in groups] == [2, 1]
           and groups[0]["x"] == 1.0,
           "probes group by operation and keep the first point")
+    four = dict(one, desc="op three")
+    check([g["desc"] for g in group_probes([one, four, two])]
+          == ["op one", "op three"],
+          "probes with the same verdict but different operations form "
+          "separate groups")
     text = "\n".join(probe_lines(groups[0]))
     check("needs      us_noaa_FL.tif  https://cdn.example/x" in text
           and "install    projsync --file us_noaa_FL.tif" in text
@@ -813,8 +945,10 @@ def _self_test(tmp, user_dir):
     base = ["--from", "EPSG:2237", "--to", "EPSG:2883"]
     check(run_cli(base + ["--parcel-acres", "0"])[0] == 64
           and run_cli(base + ["--parcel-acres", "nan"])[0] == 64
-          and run_cli(base + ["--parcel-acres", "inf"])[0] == 64,
-          "a parcel of zero, nan or infinite acres is a usage error")
+          and run_cli(base + ["--parcel-acres", "inf"])[0] == 64
+          and run_cli(base + ["--parcel-acres", "1e308"])[0] == 64,
+          "a parcel of zero, nan, infinite or overflowing acres is a usage "
+          "error  <-- pinned defect")
     check(run_cli(base + ["--control", "a", "--emit-control", "b"])[0] == 64,
           "--control and --emit-control together are a usage error")
     check(run_cli(base + ["--point", "-82.0,29.2"])[0] == 64,
@@ -883,9 +1017,28 @@ def _self_test(tmp, user_dir):
     check(code == 0,
           "a single-operation transformer is read through its own JSON and "
           "its Null geographic offset is not flagged  <-- pinned defect")
+    code, out, err = run_cli(["--from", "EPSG:6318", "--to", "EPSG:4326",
+                              "--point", "-82.0", "29.2"])
+    code2, out2, err2 = run_cli(["--from", "EPSG:4258", "--to", "EPSG:4326",
+                                 "--point", "10", "50"])
+    check(code == 1 and code2 == 1
+          and "NAD83(2011) to WGS 84 (1)" in out
+          and "ETRS89 to WGS 84 (1)" in out2
+          and "a grid cannot fix this pair" in out
+          and "a grid cannot fix this pair" in out2,
+          "NAD83(2011) and ETRS89 to WGS 84 are declared zero shifts with "
+          "no better operation, so they exit 1 on any host")
     code, out, err = run_cli(["--from", "EPSG:4267", "--to", "EPSG:4269"])
     check(code in (1, 3) and "probe(s), first at" in out,
           "with no --point the centre of both areas of use is probed")
+    code, out, err = run_cli(["--from", "EPSG:2237", "--to", "EPSG:4326"])
+    where = out.split("first at ")[1].split("\n")[0].split(", ")
+    lon, lat = pyproj.Transformer.from_crs(
+        "EPSG:2237", "EPSG:4326", always_xy=True).transform(
+            float(where[0]), float(where[1]))
+    area = pyproj.CRS.from_user_input("EPSG:2237").area_of_use
+    check(area.west < lon < area.east and area.south < lat < area.north,
+          "the default probe of a zone to the globe lies inside the zone")
     code, out, err = run_cli(["--from", "EPSG:4326", "--to", "EPSG:4326",
                               "--point", "-82", "29", "--point", "-81", "30"])
     check(code == 0 and "2 probe(s)" in out,
@@ -961,6 +1114,87 @@ def _self_test(tmp, user_dir):
           "a host without the grids refuses to emit control values and "
           "writes nothing  <-- pinned defect")
 
+    # the operation depends on the position, so every row is probed, not only
+    # the --point values (ED50 to ETRS89 is a real operation at 10 E 50 N and
+    # a ballpark offset at 3 W 54 N when the grids are missing)
+    ed50 = ["--from", "EPSG:4230", "--to", "EPSG:4258", "--point", "10", "50"]
+    near = write("near.csv", "sx,sy\n10,50\n")
+    far = write("far.csv", "sx,sy\n-3,54\n")
+    code, out, err = run_cli(ed50 + ["--emit-control", near])
+    check(code == 0 and out.startswith("sx,sy,tx,ty\n10.000000,50.000000,"),
+          "an emit row in a covered area is written")
+    code, out, err = run_cli(ed50 + ["--emit-control", far])
+    check(code == 1 and out == "" and "NULL SHIFT" in err
+          and "refused to emit control values" in err,
+          "an emit row in a fallback area is refused even when --point sits "
+          "in a covered area  <-- pinned defect")
+    ctl = write("ctl.csv", "sx,sy,tx,ty\n-3,54,-2.99,54.003\n")
+    code, out, err = run_cli(ed50 + ["--control", ctl])
+    check(code == 1 and "RESULT: NULL SHIFT (exit 1)" in out
+          and "first at -3.0, 54.0" in out,
+          "a control row in a fallback area decides the exit code even when "
+          "--point sits in a covered area  <-- pinned defect")
+    huge = write("huge.csv", "sx,sy\n600000,1500000\n1e30,1e30\n")
+    code, out, err = run_cli(base + ["--point", "500000", "1500000",
+                                     "--emit-control", huge])
+    check(code == 2 and "no coordinate" in err and out == "",
+          "an emit row PROJ cannot transform exits 2 and prints no truth  "
+          "<-- pinned defect")
+
+    # a CRS name with a character the console cannot print
+    greek = ('GEOGCS["\u03b1",DATUM["D_WGS_1984",SPHEROID["WGS_1984",'
+             '6378137,298.257223563]],PRIMEM["Greenwich",0],'
+             'UNIT["Degree",0.0174532925199433]]')
+    narrow = io.TextIOWrapper(io.BytesIO(), encoding="ascii")
+    with contextlib.redirect_stdout(narrow):
+        code = main(["--from", greek, "--to", "EPSG:4326",
+                     "--point", "-82", "29"])
+    narrow.flush()
+    check(code == 0 and b"datumcheck: GEOGCS[" in narrow.buffer.getvalue(),
+          "a CRS with a Greek letter in its name is checked, not lost to a "
+          "console encoding error  <-- pinned defect")
+
+    # PROJ network mode: PROJ calls out and PROJ writes cache.db, this tool
+    # does neither. The stub answers 404, so the run reads no grid.
+    asked = []
+
+    class Stub(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            asked.append(self.path)
+            self.send_response(404)
+            self.end_headers()
+
+        do_HEAD = do_GET
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Stub)
+    thread = threading.Thread(target=server.serve_forever)
+    thread.daemon = True
+    thread.start()
+    net_dir = os.path.join(tmp, "proj-net")
+    os.mkdir(net_dir)
+    env = dict(os.environ, PROJ_NETWORK="ON",
+               PROJ_USER_WRITABLE_DIRECTORY=net_dir,
+               PROJ_NETWORK_ENDPOINT="http://127.0.0.1:%d" %
+               server.server_address[1])
+    try:
+        proc = subprocess.run(
+            [sys.executable, os.path.abspath(__file__)] + fl, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+    check(proc.returncode in (0, 1, 2, 3) and len(asked) > 0
+          and all(path.endswith(".tif") for path in asked),
+          "with PROJ_NETWORK=ON the run asks only the endpoint for grid "
+          "files, and the tool takes no URL from its input")
+    check(os.listdir(net_dir) == ["cache.db"],
+          "with PROJ_NETWORK=ON PROJ writes cache.db to its user directory "
+          "and nothing else is written")
+
     # failures that must stop the run, not pass it
     code, out, err = run_cli(["--from", "EPSG:9999999", "--to", "EPSG:2883"])
     check(code == 2 and "cannot read a CRS" in err,
@@ -978,7 +1212,7 @@ def _self_test(tmp, user_dir):
                                    "1e30,1e30,1,1\n")
     code, out, err = run_cli(base + ["--point", "500000", "1500000",
                                      "--control", outside])
-    check(code == 2 and "control row" in err,
+    check(code == 2 and "no coordinate for 1e+30, 1e+30" in err,
           "a control row PROJ cannot transform exits 2 instead of passing")
 
     # the switch pyproj already has: it never raises, and which value it
