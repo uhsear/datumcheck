@@ -67,6 +67,12 @@ DEFAULT_PARCEL_ACRES = 1.0
 # covers another state or country is not reported as missing here.
 PROBE_BOX_DEGREES = 0.01
 
+# Oldest pyproj and PROJ the tool accepts. Before PROJ 9.2 the database has no
+# NADCON5 operations, so the report said "a grid cannot fix this pair" for
+# pairs that a grid does fix, and pyproj 3.4 has no only_best argument.
+MIN_PYPROJ = (3, 5)
+MIN_PROJ = (9, 2)
+
 # A point that moves less than this many degrees (about 0.1 mm) did not move.
 # Used only where the operation holds an optional grid, which PROJ skips
 # without a warning when the file is missing.
@@ -253,6 +259,15 @@ def parse_rows(text, columns):
     value that is not a finite number, names its line in the error.
     """
     reader = csv.DictReader(io.StringIO(text))
+    try:
+        return _parse_records(reader, columns)
+    except csv.Error as exc:
+        # A NUL byte (Python before 3.11) or a field over 128 KiB.
+        raise ValueError("line %d: %s" % (reader.line_num, exc))
+
+
+def _parse_records(reader, columns):
+    """The body of parse_rows; csv.Error escapes to the caller."""
     fields = reader.fieldnames or []
     missing = [c for c in columns if c not in fields]
     if missing:
@@ -278,33 +293,99 @@ def parse_rows(text, columns):
     return rows
 
 
-def area_centre(bounds_a, bounds_b):
-    """Centre of the overlap of two (west, south, east, north) boxes.
+def box_overlap(box_a, box_b):
+    """The widest overlap of two (west, south, east, north) boxes, or None.
 
     A box whose west is greater than its east crosses the antimeridian. Its
     east is unwrapped by 360 degrees, and the second box is tried at three
-    offsets. When two boxes overlap in two places, the wider overlap wins; the
-    first one found wins a tie.
+    offsets. The overlap east may then exceed 180. When two boxes overlap in
+    two places, the wider overlap wins; the first one found wins a tie.
     """
-    for bounds in (bounds_a, bounds_b):
-        if bounds is None:
-            raise ValueError("a CRS has no area of use; pass --point")
-    east_a = bounds_a[2] + (360.0 if bounds_a[0] > bounds_a[2] else 0.0)
-    east_b = bounds_b[2] + (360.0 if bounds_b[0] > bounds_b[2] else 0.0)
-    south = max(bounds_a[1], bounds_b[1])
-    north = min(bounds_a[3], bounds_b[3])
+    east_a = box_a[2] + (360.0 if box_a[0] > box_a[2] else 0.0)
+    east_b = box_b[2] + (360.0 if box_b[0] > box_b[2] else 0.0)
+    south = max(box_a[1], box_b[1])
+    north = min(box_a[3], box_b[3])
     best = None
     for shift in (0.0, 360.0, -360.0):
-        west = max(bounds_a[0], bounds_b[0] + shift)
+        west = max(box_a[0], box_b[0] + shift)
         east = min(east_a, east_b + shift)
         if west < east and south < north and (
                 best is None or east - west > best[1] - best[0]):
             best = (west, east)
     if best is None:
+        return None
+    return best[0], south, best[1], north
+
+
+def area_centre(bounds_a, bounds_b, prefer=None):
+    """Centre of the overlap of two (west, south, east, north) boxes.
+
+    prefer is the box of the most accurate operation. When it overlaps the
+    two areas of use, the centre is taken inside it, so that the probe lies
+    where PROJ has a real operation and not on a coast or at sea.
+    """
+    for bounds in (bounds_a, bounds_b):
+        if bounds is None:
+            raise ValueError("a CRS has no area of use; pass --point")
+    box = box_overlap(bounds_a, bounds_b)
+    if box is None:
         raise ValueError("the two CRS areas of use do not overlap; pass "
                          "--point")
-    lon = (best[0] + best[1]) / 2.0
-    return ((lon + 180.0) % 360.0) - 180.0, (south + north) / 2.0
+    narrow = None if prefer is None else box_overlap(box, prefer)
+    if narrow is not None:
+        box = narrow
+    lon = (box[0] + box[2]) / 2.0
+    return ((lon + 180.0) % 360.0) - 180.0, (box[1] + box[3]) / 2.0
+
+
+def box_span(box):
+    """Degrees of longitude times degrees of latitude of a box."""
+    width = box[2] - box[0] + (360.0 if box[0] > box[2] else 0.0)
+    return width * (box[3] - box[1])
+
+
+def best_operation_box(ops):
+    """The box of the most accurate operation that has a known accuracy and a
+    known area of use. The widest box wins a tie. None when no operation
+    qualifies. Each op is a dict with 'accuracy' and 'box'."""
+    best = None
+    for op in ops:
+        if op["accuracy"] < 0 or op["box"] is None:
+            continue
+        key = (op["accuracy"], -box_span(op["box"]))
+        if best is None or key < best[0]:
+            best = (key, op["box"])
+    return None if best is None else best[1]
+
+
+def in_area(lon, lat, bounds):
+    """True when a point lies inside a (west, south, east, north) box. A box
+    whose west is greater than its east crosses the antimeridian."""
+    west, south, east, north = bounds
+    if not south <= lat <= north:
+        return False
+    if west <= east:
+        return west <= lon <= east
+    return lon >= west or lon <= east
+
+
+def valid_lonlat(x, y):
+    """True when x and y can be a longitude and a latitude in degrees."""
+    return -180.0 <= x <= 360.0 and -90.0 <= y <= 90.0
+
+
+def version_at_least(text, minimum):
+    """True when a dotted version text such as '3.8.0' is at least the tuple
+    minimum. Text after the digits of a part, as in '3.5rc1', is ignored."""
+    numbers = []
+    for part in str(text).split(".")[:len(minimum)]:
+        digits = ""
+        for char in part:
+            if not char.isdigit():
+                break
+            digits += char
+        numbers.append(int(digits) if digits else 0)
+    return tuple(numbers) >= tuple(minimum)
 
 
 def probe_box(lon, lat, half):
@@ -384,7 +465,7 @@ def probe_lines(group):
     for op in better:
         for grid in op["grids"]:
             name = grid["short_name"]
-            if name in seen:
+            if name in seen or grid.get("available", False):
                 continue
             seen.append(name)
             where = grid["url"] if grid["direct_download"] else \
@@ -415,13 +496,16 @@ def _import_pyproj():
     except ImportError:
         raise RuntimeError(
             "pyproj was not found. Install it with: python -m pip install "
-            "pyproj. Only the pure functions run without it.")
-    transformer = getattr(pyproj, "Transformer", None)
-    if not hasattr(transformer, "get_last_used_operation"):
+            "pyproj.")
+    have_pyproj = getattr(pyproj, "__version__", "unknown")
+    have_proj = getattr(pyproj, "proj_version_str", "unknown")
+    if not (version_at_least(have_pyproj, MIN_PYPROJ)
+            and version_at_least(have_proj, MIN_PROJ)):
         raise RuntimeError(
-            "pyproj %s cannot report the operation PROJ used. "
-            "Transformer.get_last_used_operation needs pyproj 3.4 and PROJ "
-            "9.1 or newer." % getattr(pyproj, "__version__", "unknown"))
+            "pyproj %s with PROJ %s is too old. datumcheck needs pyproj "
+            "%d.%d and PROJ %d.%d or newer: they add "
+            "Transformer.get_last_used_operation, only_best and the NADCON5 "
+            "operations." % ((have_pyproj, have_proj) + MIN_PYPROJ + MIN_PROJ))
     return pyproj
 
 
@@ -441,9 +525,8 @@ def _op_facts(op):
     return data.get("steps") or [data], op.accuracy, op.description
 
 
-def _unavailable(pyproj, src, dst, to_lonlat, x, y):
+def _unavailable(pyproj, src, dst, lon, lat):
     """Operations around a probe that PROJ knows but cannot use."""
-    lon, lat = to_lonlat.transform(x, y)
     area = pyproj.transformer.AreaOfInterest(
         *probe_box(lon, lat, PROBE_BOX_DEGREES))
     with warnings.catch_warnings():
@@ -453,7 +536,8 @@ def _unavailable(pyproj, src, dst, to_lonlat, x, y):
             area_of_interest=area)
     return [{"name": op.name, "accuracy": op.accuracy,
              "grids": [{"short_name": g.short_name, "url": g.url,
-                        "direct_download": g.direct_download}
+                        "direct_download": g.direct_download,
+                        "available": g.available}
                        for g in op.grids]}
             for op in group.unavailable_operations]
 
@@ -464,6 +548,14 @@ def probe_one(pyproj, ctx, x, y):
     if not finite_pair(gx, gy):
         raise ValueError("PROJ returned no coordinate for %r, %r. The point "
                          "is outside what the source CRS supports." % (x, y))
+    lon, lat = ctx["to_lonlat"].transform(x, y)
+    if ctx["bounds"] is not None and not in_area(lon, lat, ctx["bounds"]):
+        raise ValueError(
+            "the probe %r, %r lies outside the area of use of the source CRS "
+            "(west %g, south %g, east %g, north %g). PROJ answers there with "
+            "a ballpark offset, so the verdict would describe the probe, not "
+            "your data. Give X first: longitude for a geographic CRS." % (
+                (x, y) + tuple(ctx["bounds"])))
     try:
         op = ctx["tf"].get_last_used_operation()
     except pyproj.exceptions.ProjError:
@@ -472,8 +564,7 @@ def probe_one(pyproj, ctx, x, y):
     steps, accuracy, desc = _op_facts(op)
     # Looked up for every probe: the better operations depend on the position,
     # and one operation name can cover regions with different grids.
-    missing = _unavailable(
-        pyproj, ctx["src"], ctx["dst"], ctx["to_lonlat"], x, y)
+    missing = _unavailable(pyproj, ctx["src"], ctx["dst"], lon, lat)
     null = is_null_op(steps, accuracy)
     optional = optional_grids(steps)
     if optional:
@@ -500,14 +591,31 @@ def offset_ft(dst, expected, got):
             metres_to_ftus((got[1] - expected[1]) * factor))
 
 
-def default_probe(src, dst, to_src):
-    """The centre of the overlap of both areas of use, in source units."""
+def _best_box(pyproj, src, dst):
+    """The area of use of the most accurate operation PROJ knows for the
+    pair, whether or not this host has its grids. None when none is known."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        group = pyproj.transformer.TransformerGroup(
+            src, dst, always_xy=True, allow_ballpark=False)
+    ops = []
+    for op in list(group.transformers) + list(group.unavailable_operations):
+        area = op.area_of_use
+        ops.append({"accuracy": op.accuracy, "box": None if area is None else
+                    (area.west, area.south, area.east, area.north)})
+    return best_operation_box(ops)
+
+
+def default_probe(src, dst, to_src, prefer=None):
+    """The centre of the overlap of both areas of use, in source units. With
+    prefer, the centre of that part of the overlap which lies inside the box
+    of the most accurate operation."""
     bounds = []
     for crs in (src, dst):
         area = crs.area_of_use
         bounds.append(None if area is None else
                       (area.west, area.south, area.east, area.north))
-    lon, lat = area_centre(bounds[0], bounds[1])
+    lon, lat = area_centre(bounds[0], bounds[1], prefer)
     return to_src.transform(lon, lat)
 
 
@@ -527,19 +635,23 @@ def run_check(args, out):
         raise ValueError("cannot read a CRS: %s" % exc)
     src, dst = horizontal(src), horizontal(dst)
     tf = pyproj.Transformer.from_crs(src, dst, always_xy=True)
+    area = src.area_of_use
     ctx = {"src": src, "dst": dst, "tf": tf,
+           "bounds": None if area is None else
+           (area.west, area.south, area.east, area.north),
            "to_lonlat": pyproj.Transformer.from_crs(
                src, "EPSG:4326", always_xy=True)}
 
     control = parse_rows(read_text(args.control), CONTROL_COLUMNS) \
-        if args.control else []
+        if args.control is not None else []
     emit = parse_rows(read_text(args.emit_control), POINT_COLUMNS) \
-        if args.emit_control else []
+        if args.emit_control is not None else []
     points = collect_points(
         [check_point(x, y) for x, y in args.point or []], control, emit)
     if not points:
         to_src = pyproj.Transformer.from_crs("EPSG:4326", src, always_xy=True)
-        points = [default_probe(src, dst, to_src)]
+        points = [default_probe(src, dst, to_src,
+                                _best_box(pyproj, src, dst))]
 
     results = [probe_one(pyproj, ctx, x, y) for x, y in points]
     code = exit_code([r["verdict"] for r in results])
@@ -561,7 +673,13 @@ def run_check(args, out):
 
     if control:
         misses = []
-        for sx, sy, tx, ty in control:
+        for number, (sx, sy, tx, ty) in enumerate(control, 1):
+            if dst.is_geographic and not valid_lonlat(tx, ty):
+                raise ValueError(
+                    "control row %d: the target values %r, %r cannot be a "
+                    "longitude and a latitude in degrees. Give the control "
+                    "values in the target CRS units, longitude first." % (
+                        number, tx, ty))
             # Every control row was probed above, so its result is finite.
             misses.append(offset_ft(dst, (tx, ty), tf.transform(sx, sy)))
         report.append(control_line(
@@ -632,7 +750,7 @@ def _run(argv):
         print("error: --from and --to are required. Use --self-test to verify "
               "the tool without them.", file=sys.stderr)
         return EXIT_USAGE
-    if args.control and args.emit_control:
+    if args.control is not None and args.emit_control is not None:
         print("error: --control and --emit-control cannot be used together.",
               file=sys.stderr)
         return EXIT_USAGE
@@ -783,6 +901,10 @@ def _self_test(tmp, user_dir):
     proj = step("SPCS83 Florida North zone", [29, -84.5], kind="Conversion")
     check(is_null_step(ballpark, -1.0),
           "a Ballpark step is a null shift")
+    check(is_null_step(step("Ballpark geographic offset from A to B", []), 1.0)
+          and not is_null_step(step("Geographic offset from A to B", []), 1.0),
+          "a Ballpark step is null by its name even with no parameters  "
+          "<-- pinned defect")
     check(is_null_step(zero, 1.0),
           "a zero translation of declared accuracy 1 m is a null shift")
     check(not is_null_step(zero, 0.0),
@@ -898,6 +1020,12 @@ def _self_test(tmp, user_dir):
            "a short row is refused, not read as zero  <-- pinned defect")
     raises(lambda: parse_rows("sx,sy\n1,nan\n", POINT_COLUMNS),
            "a nan coordinate is refused")
+    raises(lambda: parse_rows("sx,sy\n1,%s\n" % ("9" * 200000), POINT_COLUMNS),
+           "a field over 128 KiB is refused as bad input, not a tool fault  "
+           "<-- pinned defect")
+    raises(lambda: parse_rows("sx,sy\n1,2\n3,4\x00\n", POINT_COLUMNS),
+           "a NUL byte in a number is refused as bad input on every Python "
+           "version  <-- pinned defect")
     check(area_centre((-90, 20, -70, 40), (-80, 30, -60, 50)) == (-75.0, 35.0),
           "the default probe is the centre of the overlap")
     raises(lambda: area_centre(None, (0, 0, 1, 1)),
@@ -928,6 +1056,48 @@ def _self_test(tmp, user_dir):
           == (-95.0, 25.0),
           "a box with west east of its east crosses the antimeridian, "
           "whatever its north is, in either argument")
+    conus = (-124.79, 23.82, -66.91, 49.38)
+    check(area_centre((-172.0, 23.0, -47.0, 86.0), (-180, -90, 180, 90),
+                      prefer=conus) == (-95.85, 36.6)
+          and area_centre((-172.0, 23.0, -47.0, 86.0), (-180, -90, 180, 90),
+                          prefer=(10, 10, 20, 20))
+          == area_centre((-172.0, 23.0, -47.0, 86.0), (-180, -90, 180, 90)),
+          "a preferred box moves the default probe inside it, and a "
+          "preferred box that misses the overlap is ignored  "
+          "<-- pinned defect")
+    check(box_overlap((0, 0, 2, 2), (1, 1, 3, 3)) == (1, 1, 2, 2)
+          and box_overlap((0, 0, 1, 1), (2, 2, 3, 3)) is None
+          and box_overlap((170, 0, -170, 10), (175, 2, -175, 8))
+          == (175, 2, 185, 8),
+          "the overlap of two boxes is a box, or None when they miss, and "
+          "it unwraps the antimeridian")
+    ops = [{"accuracy": 1.0, "box": (0, 0, 10, 10)},
+           {"accuracy": -1.0, "box": (0, 0, 1, 1)},
+           {"accuracy": 0.1, "box": None},
+           {"accuracy": 0.5, "box": (0, 0, 2, 2)},
+           {"accuracy": 0.5, "box": (0, 0, 4, 4)},
+           {"accuracy": 0.5, "box": (0, 0, 3, 3)}]
+    check(best_operation_box(ops) == (0, 0, 4, 4)
+          and best_operation_box(ops[:3]) == (0, 0, 10, 10)
+          and best_operation_box(ops[1:3]) is None
+          and best_operation_box([]) is None,
+          "the best operation is the most accurate one with a known "
+          "accuracy and a known area, the widest area winning a tie")
+    check(box_span((170, 0, -170, 10)) == 200.0
+          and box_span((0, 0, 4, 5)) == 20.0,
+          "the span of a box that crosses the antimeridian is unwrapped")
+    check(in_area(-82, 29, conus) and not in_area(29.2, -82, conus)
+          and not in_area(0, 91, conus) and not in_area(200, 50, conus)
+          and in_area(175, 5, (170, 0, -170, 10))
+          and in_area(-175, 5, (170, 0, -170, 10))
+          and not in_area(0, 5, (170, 0, -170, 10)),
+          "a point is in an area when both its coordinates are, across the "
+          "antimeridian too")
+    check(valid_lonlat(-82.0, 29.0) and valid_lonlat(359.0, -90.0)
+          and not valid_lonlat(600001.5, 1199999.6)
+          and not valid_lonlat(-82.0, 91.0) and not valid_lonlat(-181.0, 0.0)
+          and not valid_lonlat(361.0, 0.0),
+          "a longitude and latitude in degrees are in range")
     here = types.SimpleNamespace(area_of_use=types.SimpleNamespace(
         west=-90.0, south=20.0, east=-70.0, north=40.0))
     there = types.SimpleNamespace(area_of_use=types.SimpleNamespace(
@@ -989,6 +1159,15 @@ def _self_test(tmp, user_dir):
           "probes of one operation with different verdicts or missing grids "
           "are separate groups, so the first one's advice is not reused  "
           "<-- pinned defect")
+    other_grid = dict(one, missing=[{"name": "z", "accuracy": 0.01,
+                                     "grids": []}])
+    other_optional = dict(one, optional=["@conus"])
+    check(len(group_probes([one, other_grid])) == 2
+          and len(group_probes([one, other_optional])) == 2
+          and len(group_probes([one, dict(one)])) == 1,
+          "probes with one verdict that differ only in the missing grids, or "
+          "only in the optional grids, are separate groups  "
+          "<-- pinned defect")
     text = "\n".join(probe_lines(groups[0]))
     check("needs      us_noaa_FL.tif  https://cdn.example/x" in text
           and "install    projsync --file us_noaa_FL.tif" in text
@@ -1009,6 +1188,15 @@ def _self_test(tmp, user_dir):
               dict(groups[0], optional=["@conus"]))),
           "a null shift from a missing optional grid says so, and a clean "
           "probe does not")
+    half = [{"name": "a", "accuracy": 0.05, "grids": [
+        {"short_name": "have.tif", "url": "https://cdn.example/have",
+         "direct_download": True, "available": True},
+        {"short_name": "lack.tif", "url": "https://cdn.example/lack",
+         "direct_download": True, "available": False}]}]
+    half_text = "\n".join(probe_lines(dict(groups[0], missing=half)))
+    check("lack.tif" in half_text and "have.tif" not in half_text,
+          "a grid that is already installed is not listed as needed  "
+          "<-- pinned defect")
     off_cdn = [{"name": "a", "accuracy": 0.5, "grids": [
         {"short_name": "a.gsb", "url": "", "direct_download": False},
         {"short_name": "a.gsb", "url": "", "direct_download": False}]}]
@@ -1071,16 +1259,27 @@ def _self_test(tmp, user_dir):
     check(blocked == 2 and "the real PROJ checks need pyproj" in buf.getvalue(),
           "--self-test without pyproj says so and exits 2, not 70  "
           "<-- pinned defect")
-    old = types.ModuleType("pyproj")
-    old.Transformer = type("Transformer", (), {})
-    sys.modules["pyproj"] = old
-    try:
-        code, out, err = run_cli(base)
-    finally:
-        sys.modules["pyproj"] = real_module
-    check(code == 2 and "needs pyproj 3.4" in err,
-          "a pyproj without get_last_used_operation exits 2 and names the "
-          "version it needs")
+    codes = []
+    for have in (("3.4.1", "9.1.0"), ("3.8.0", "9.1.0"), ("3.4.1", "9.2.0")):
+        old = types.ModuleType("pyproj")
+        old.__version__, old.proj_version_str = have
+        sys.modules["pyproj"] = old
+        try:
+            code, out, err = run_cli(base)
+        finally:
+            sys.modules["pyproj"] = real_module
+        codes.append((code, "needs pyproj 3.5 and PROJ 9.2" in err))
+    check(codes == [(2, True)] * 3,
+          "a pyproj older than 3.5, or a PROJ older than 9.2, exits 2 and "
+          "names the versions it needs  <-- pinned defect")
+    check(version_at_least("3.5.0", (3, 5)) and version_at_least("3.8.0", (3, 5))
+          and version_at_least("10.0", (9, 2)) and version_at_least("9.2", (9, 2))
+          and version_at_least("3.5rc1", (3, 5))
+          and not version_at_least("3.4.1", (3, 5))
+          and not version_at_least("9.1.0", (9, 2))
+          and not version_at_least("unknown", (3, 5)),
+          "a version text compares by its first two numbers and an unreadable "
+          "one is too old")
 
     # ---- real PROJ with the grids hidden
     pyproj = real_module
@@ -1106,7 +1305,7 @@ def _self_test(tmp, user_dir):
     check(code == 3 and "DEGRADED" in out and ".tif" in out,
           "Florida West to North without grids is degraded and exits 3")
     code, out, err = run_cli(["--from", "EPSG:6440", "--to", "EPSG:6440",
-                              "--point", "600000", "1500000"])
+                              "--point", "600000", "160000"])
     check(code == 0 and "no null shift found" in out and ".tif" not in out,
           "one datum to itself needs no shift and exits 0")
     code, out, err = run_cli(["--from", "EPSG:4326", "--to", "EPSG:4979",
@@ -1236,10 +1435,60 @@ def _self_test(tmp, user_dir):
                           - 1200.0 / 3937.0) < 1e-15,
           "EPSG records the US survey foot as 1200/3937 of a metre")
 
+    geo_crs = pyproj.CRS.from_user_input("EPSG:4269")
+    two_axis = offset_ft(geo_crs, (-82.0, 29.0), (-81.9999, 29.0001))
+    check(abs(two_axis[0] - 31.97) < 0.05 and abs(two_axis[1] - 36.36) < 0.05,
+          "a geographic target measures east and north on separate meridian "
+          "and parallel arcs, 31.97 and 36.36 ftUS for 0.0001 degrees each")
+
+    # a latitude-first point, or a point off the map, is refused, because
+    # PROJ answers there with a ballpark offset and the verdict would be
+    # about the probe, not about the data
+    geo_pair = ["--from", "EPSG:4269", "--to", "EPSG:4326"]
+    code, out, err = run_cli(geo_pair + ["--point", "29.2", "-82"])
+    check(code == 2 and "outside the area of use of the source CRS" in err
+          and "Give X first" in err,
+          "a latitude-first --point on a geographic source exits 2, not 1 or "
+          "0 by chance  <-- pinned defect")
+    check(run_cli(geo_pair + ["--point", "0", "91"])[0] == 2
+          and run_cli(geo_pair + ["--point", "200", "50"])[0] == 2
+          and run_cli(["--from", "EPSG:2236", "--to", "EPSG:6438",
+                       "--point", "5000000", "5000000"])[0] == 2,
+          "a probe outside the area of use of the source CRS exits 2  "
+          "<-- pinned defect")
+
+    # the default probe lies where the most accurate operation applies, not
+    # at sea (the old centre of the two areas, -128.1 44.8, is in the Pacific)
+    code, out, err = run_cli(["--from", "EPSG:4269", "--to", "EPSG:6318"])
+    where = out.split("first at ")[1].split("\n")[0].split(", ")
+    check(-124.79 < float(where[0]) < -66.91
+          and 23.82 < float(where[1]) < 49.38 and float(where[0]) > -125.0
+          and abs(float(where[0]) + 128.115) > 1.0,
+          "the default probe of NAD83 to NAD83(2011) lies in the CONUS "
+          "NADCON5 area, not offshore  <-- pinned defect")
+
+    # control values for a geographic target must be degrees
+    units = write("units.csv", "sx,sy,tx,ty\n600000,1200000,600001.5,1199999.6\n")
+    code, out, err = run_cli(["--from", "EPSG:2236", "--to", "EPSG:4269",
+                              "--control", units])
+    check(code == 2 and "control row 1" in err and "nan" not in out
+          and "RESULT" not in out,
+          "control values in projected units for a geographic target exit 2 "
+          "and print no nan  <-- pinned defect")
+
+    # an empty path is a path, not a flag that was not passed
+    empty_ctl = run_cli(base + ["--control", ""])
+    empty_emit = run_cli(base + ["--emit-control", ""])
+    check(empty_ctl[0] == 2 and empty_emit[0] == 2 and empty_emit[1] == ""
+          and run_cli(base + ["--control", "", "--emit-control", ""])[0] == 64,
+          "an empty --control or --emit-control is an unreadable file, exit "
+          "2, not a flag that was left out  <-- pinned defect")
+
     # emit-control is the hand-off from a host that has the grids
     pts = write("pts.csv", "sx,sy\n600000,1500000\n610000,1510000\n")
+    pts_same = write("pts-same.csv", "sx,sy\n600000,160000\n610000,170000\n")
     code, out, err = run_cli(["--from", "EPSG:6440", "--to", "EPSG:6440",
-                              "--emit-control", pts])
+                              "--emit-control", pts_same])
     check(code == 0 and out.startswith("sx,sy,tx,ty\n")
           and out.count("\n") == 3,
           "--emit-control prints a header and one row per point")
