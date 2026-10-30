@@ -18,6 +18,10 @@ acres of a parcel that moved that far.
     python datumcheck.py --from EPSG:2237 --to EPSG:2883 --control truth.csv
     python datumcheck.py --from EPSG:2237 --to EPSG:2883 --emit-control pts.csv
 
+With no --point, --control or --emit-control the probe is the centre of both
+areas of use, which can lie offshore. A ballpark offset there exits 2 and asks
+for --point.
+
 The check writes no file. --emit-control prints to standard output, so a host
 that has the grids can hand the truth to a host that has not. Two things write
 outside this tool's control: --self-test puts CSV fixtures in a temporary
@@ -39,6 +43,7 @@ import importlib.util
 import io
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -176,6 +181,13 @@ def is_null_op(steps, op_accuracy):
     return all(is_null_step(s, op_accuracy) for s in datum)
 
 
+def uses_ballpark(steps):
+    """True when any datum step is a PROJ "Ballpark" offset."""
+    return any(s.get("type") == "Transformation"
+               and str(s.get("name", "")).startswith("Ballpark")
+               for s in steps)
+
+
 def optional_grids(steps):
     """Names of the optional grids ("@name") that the datum steps hold.
 
@@ -232,6 +244,27 @@ def exit_code(verdicts):
     if DEGRADED in verdicts:
         return EXIT_DEGRADED
     return EXIT_OK
+
+
+def version_tuple(text):
+    """The first two numbers of a version string: "3.8.0" is (3, 8)."""
+    parts = [int(n) for n in re.findall(r"\d+", str(text))[:2]]
+    return tuple(parts + [0] * (2 - len(parts)))
+
+
+def self_test_blocker(pyproj_version, proj_version):
+    """Why the self-test cannot run on this stack, or None when it can.
+
+    The self-test passes only_best (pyproj 3.5 or newer) and expects NADCON5
+    operations in proj.db (PROJ 9.2 or newer). Older stacks check correctly
+    but would fail the self-test for a reason that says nothing about the tool.
+    """
+    if (version_tuple(pyproj_version) < (3, 5)
+            or version_tuple(proj_version) < (9, 2)):
+        return ("the self-test needs pyproj 3.5 and PROJ 9.2 or newer, found "
+                "pyproj %s with PROJ %s. The check itself runs on pyproj 3.4."
+                % (pyproj_version, proj_version))
+    return None
 
 
 def finite_pair(a, b):
@@ -463,7 +496,8 @@ def probe_one(pyproj, ctx, x, y):
     gx, gy = ctx["tf"].transform(x, y)
     if not finite_pair(gx, gy):
         raise ValueError("PROJ returned no coordinate for %r, %r. The point "
-                         "is outside what the source CRS supports." % (x, y))
+                         "is outside what the source CRS supports, or a grid "
+                         "it needs could not be read." % (x, y))
     try:
         op = ctx["tf"].get_last_used_operation()
     except pyproj.exceptions.ProjError:
@@ -485,6 +519,7 @@ def probe_one(pyproj, ctx, x, y):
         null = null or unmoved(x, y, gx, gy)
     return {"x": x, "y": y, "desc": desc, "accuracy": accuracy,
             "missing": missing, "optional": optional,
+            "ballpark": uses_ballpark(steps),
             "verdict": judge(null, accuracy, missing)}
 
 
@@ -517,6 +552,30 @@ def read_text(path):
         return handle.read()
 
 
+DEFAULT_PROBE_NOTE = (
+    "note: no --point, --control or --emit-control, so the probe is the centre "
+    "of both areas of use. It can lie offshore or outside every grid. Pass "
+    "--point with a place in your data.")
+
+
+def refuse_defaulted_ballpark(res):
+    """Raise ValueError when the default probe cannot support its verdict.
+
+    The centre of the two areas of use is often offshore, where PROJ falls
+    back to a ballpark offset even on a host that holds every grid, and no
+    listed grid can change that. Such a verdict describes the probe, not the
+    data, so the run stops with exit 2 instead of failing a good host.
+    """
+    if (res["verdict"] == NULL_SHIFT and res["ballpark"]
+            and not better_missing(res["accuracy"], res["missing"])):
+        raise ValueError(
+            "the default probe at %r, %r fell on a ballpark offset (%s) and "
+            "no listed grid can change that. The centre of both areas of use "
+            "can lie offshore or outside every grid, so this says nothing "
+            "about your data. Pass --point with a place in your data." % (
+                res["x"], res["y"], ascii_text(res["desc"])))
+
+
 def run_check(args, out):
     """Run the whole check. Returns the exit code; writes the report to out."""
     pyproj = _import_pyproj()
@@ -537,20 +596,26 @@ def run_check(args, out):
         if args.emit_control else []
     points = collect_points(
         [check_point(x, y) for x, y in args.point or []], control, emit)
-    if not points:
+    defaulted = not points
+    if defaulted:
         to_src = pyproj.Transformer.from_crs("EPSG:4326", src, always_xy=True)
         points = [default_probe(src, dst, to_src)]
 
     results = [probe_one(pyproj, ctx, x, y) for x, y in points]
+    if defaulted:
+        refuse_defaulted_ballpark(results[0])
     code = exit_code([r["verdict"] for r in results])
     report = [report_header(args.src, args.dst)]
+    if defaulted:
+        report.append(DEFAULT_PROBE_NOTE)
     for group in group_probes(results):
         report.extend(probe_lines(group))
 
     if emit:
         if code != EXIT_OK:
-            report.append("refused to emit control values: this host did not "
-                          "use the best available operation")
+            report.append("refused to emit control values: PROJ used a null "
+                          "shift here, or a more accurate operation is "
+                          "missing on this host")
             print("\n".join(report), file=sys.stderr)
             return code
         out.write("sx,sy,tx,ty\n")
@@ -660,9 +725,14 @@ def self_test():
         os.environ["PROJ_USER_WRITABLE_DIRECTORY"] = user_dir
         os.environ["PROJ_NETWORK"] = "OFF"
         try:
-            _import_pyproj()
+            module = _import_pyproj()
         except RuntimeError as exc:
             print("self-test: the real PROJ checks need pyproj. %s" % exc)
+            return EXIT_ERROR
+        blocker = self_test_blocker(module.__version__,
+                                    module.proj_version_str)
+        if blocker:
+            print("self-test: %s" % blocker)
             return EXIT_ERROR
         return _self_test(tmp, user_dir)
     finally:
@@ -816,6 +886,29 @@ def _self_test(tmp, user_dir):
           "a chain with one real step is not null")
     check(not is_null_op([proj, proj], 0.0),
           "an operation with no datum step shifts nothing and needs nothing")
+    bare = step("Ballpark geographic offset from A to B", [])
+    check(is_null_step(bare, -1.0) and not is_null_step(
+        step("ballpark geographic offset from A to B", []), -1.0)
+        and not is_null_step(step("Helmert from A to B", []), -1.0),
+          "a Ballpark step with no parameters is null by its name alone, and "
+          "a nameless parameterless step is not")
+    check(uses_ballpark([proj, bare]) and uses_ballpark([zero, ballpark])
+          and not uses_ballpark([proj, zero, real])
+          and not uses_ballpark([step("Ballpark x", [], kind="Conversion")]),
+          "uses_ballpark finds a Ballpark datum step and nothing else")
+    check(version_tuple("3.8.0") == (3, 8) and version_tuple("9.8.1") == (9, 8)
+          and version_tuple("3.10.2.post1") == (3, 10)
+          and version_tuple("9") == (9, 0) and version_tuple("") == (0, 0),
+          "a version string reads as its first two numbers")
+    check(self_test_blocker("3.5.0", "9.2.0") is None
+          and self_test_blocker("3.8.0", "9.8.1") is None
+          and self_test_blocker("3.10.0", "9.2.0") is None
+          and "pyproj 3.4.0 with PROJ 9.1.0" in self_test_blocker("3.4.0",
+                                                                 "9.1.0")
+          and self_test_blocker("3.6.1", "9.1.0") is not None
+          and self_test_blocker("3.4.0", "9.3.0") is not None,
+          "the self-test refuses pyproj before 3.5 or PROJ before 9.2, and "
+          "runs on anything newer  <-- pinned defect")
     grids = [{"short_name": "us_noaa_FL.tif", "url": "https://cdn.example/x",
               "direct_download": True}]
     unavailable = [{"name": "a", "accuracy": 0.05, "grids": grids},
@@ -989,6 +1082,25 @@ def _self_test(tmp, user_dir):
           "probes of one operation with different verdicts or missing grids "
           "are separate groups, so the first one's advice is not reused  "
           "<-- pinned defect")
+    # each element of the group key is pinned alone: the two probes below
+    # differ in exactly one of missing grids, verdict or optional grids
+    alaska = dict(one, missing=[{"name": "alaska op", "accuracy": 0.05,
+                                 "grids": grids}])
+    hawaii = dict(one, missing=[{"name": "hawaii op", "accuracy": 0.05,
+                                 "grids": grids}])
+    check(len(group_probes([alaska, hawaii])) == 2
+          and len(group_probes([alaska, dict(alaska, x=9.0)])) == 1,
+          "probes of one operation and verdict that miss different grids are "
+          "separate groups  <-- pinned defect")
+    check(len(group_probes([one, dict(one, verdict=NULL_SHIFT)])) == 2
+          and len(group_probes([one, dict(one, verdict=DEGRADED)])) == 1,
+          "probes of one operation and the same missing grids that differ "
+          "only in verdict are separate groups  <-- pinned defect")
+    check(len(group_probes([one, dict(one, optional=["@conus"])])) == 2
+          and len(group_probes([dict(one, optional=["@conus"]),
+                                dict(one, optional=["@conus"])])) == 1,
+          "probes that differ only in their optional grids are separate "
+          "groups  <-- pinned defect")
     text = "\n".join(probe_lines(groups[0]))
     check("needs      us_noaa_FL.tif  https://cdn.example/x" in text
           and "install    projsync --file us_noaa_FL.tif" in text
@@ -1081,6 +1193,21 @@ def _self_test(tmp, user_dir):
     check(code == 2 and "needs pyproj 3.4" in err,
           "a pyproj without get_last_used_operation exits 2 and names the "
           "version it needs")
+    older = types.ModuleType("pyproj")
+    older.Transformer = type("Transformer", (), {
+        "get_last_used_operation": None})
+    older.__version__, older.proj_version_str = "3.4.0", "9.1.0"
+    sys.modules["pyproj"] = older
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            blocked = self_test()
+    finally:
+        sys.modules["pyproj"] = real_module
+    check(blocked == 2 and "needs pyproj 3.5 and PROJ 9.2" in buf.getvalue()
+          and "PASS" not in buf.getvalue(),
+          "--self-test on pyproj 3.4 says what it needs and exits 2, not 70  "
+          "<-- pinned defect")
 
     # ---- real PROJ with the grids hidden
     pyproj = real_module
@@ -1125,9 +1252,24 @@ def _self_test(tmp, user_dir):
           and "a grid cannot fix this pair" in out2,
           "NAD83(2011) and ETRS89 to WGS 84 are declared zero shifts with "
           "no better operation, so they exit 1 on any host")
+    code, out, err = run_cli(["--from", "EPSG:6440", "--to", "EPSG:6440"])
+    check(code == 0 and "probe(s), first at" in out
+          and "the probe is the centre of both areas of use" in out,
+          "with no --point the centre of both areas of use is probed, and "
+          "the report says so")
+    code, out, err = run_cli(["--from", "EPSG:4269", "--to", "EPSG:6318"])
+    check(code == 2 and out == "" and "default probe" in err
+          and "ballpark offset" in err and "Pass --point" in err,
+          "a default probe that falls offshore on a ballpark offset exits 2 "
+          "and asks for --point instead of failing a good host  "
+          "<-- pinned defect")
+    code, out, err = run_cli(["--from", "EPSG:4258", "--to", "EPSG:4326"])
+    check(code == 1 and "RESULT: NULL SHIFT (exit 1)" in out
+          and "a grid cannot fix this pair" in out,
+          "a default probe on a declared zero shift is still a null shift")
     code, out, err = run_cli(["--from", "EPSG:4267", "--to", "EPSG:4269"])
-    check(code in (1, 3) and "probe(s), first at" in out,
-          "with no --point the centre of both areas of use is probed")
+    check(code in (1, 2, 3),
+          "a default probe never exits 0 for a pair that needs a grid")
     code, out, err = run_cli(["--from", "EPSG:2237", "--to", "EPSG:4326"])
     where = out.split("first at ")[1].split("\n")[0].split(", ")
     lon, lat = pyproj.Transformer.from_crs(
@@ -1155,6 +1297,15 @@ def _self_test(tmp, user_dir):
     check(out.count("probe(s)") == 2 and "us_noaa_hihpgn.tif" in out,
           "the clean Nihoa probe and the degraded Oahu probe are reported "
           "apart, with the grids for Oahu  <-- pinned defect")
+
+    # the same operation name serves Alaska and Hawaii, whose grids differ
+    code, out, err = run_cli(
+        ["--from", "EPSG:4269", "--to", "EPSG:6318", "--point", "-82", "29",
+         "--point", "-150", "62", "--point", "-157.8", "21.3"])
+    check(out.count("probe(s)") == 3
+          and "nad83_1992_alaska.tif" in out and code == 1,
+          "probes in Florida, Alaska and Hawaii are three groups, and Alaska "
+          "names its own grids  <-- pinned defect")
 
     # an optional grid that is not on the host is skipped without a warning
     legacy = ("+proj=longlat +datum=NAD27 +nadgrids=@conus,@alaska,@ntv2_0.gsb,"
@@ -1391,6 +1542,14 @@ def _self_test(tmp, user_dir):
     check(math.isinf(best_x) or best_x == default_x,
           "pyproj only_best=True raises nothing here: it returns inf or the "
           "same fallback coordinate, depending on the PROJ version")
+    gated = []
+    with contextlib.suppress(pyproj.exceptions.ProjError):
+        gated.append(pyproj.Transformer.from_crs(
+            "EPSG:2237", "EPSG:2883", always_xy=True, only_best=True)
+            .transform(500000.0, 1500000.0, errcheck=True)[0])
+    check(gated == [] or gated == [default_x],
+          "pyproj only_best=True with errcheck=True raises ProjError or "
+          "returns the fallback coordinate, depending on the PROJ version")
 
     # ---- a fault in this tool is not a finding about the data
     real_run = globals()["_run"]
