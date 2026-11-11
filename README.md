@@ -493,7 +493,7 @@ area-of-use refusal now rejects those points with exit 2.
   exits 2 and prints no PASS lines. The 179 assertion result needs a virtual environment with pyproj.
 - Branch coverage is 100 percent on both hosts, from `coverage run --branch datumcheck.py
   --self-test`: 888 statements and 166 branches on the Windows venv (coverage 7.16.1) and the same
-  888 and 166 on Linux (coverage 7.17.0), with none missed or partly covered. No line is excluded.
+  888 and 166 on Linux (coverage 7.17.2), with none missed or partly covered. No line is excluded.
   The network lines run against the loopback stub. All hosts run the same 179 assertions, because
   the real PROJ part runs on every host with the grids hidden.
 
