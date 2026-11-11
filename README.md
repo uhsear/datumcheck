@@ -11,7 +11,7 @@ It is not right. The pip wheel carries no datum grids, so PROJ could not use the
 needs one. It fell back to a zero translation, or to a "ballpark" offset that moves nothing.
 Every point landed about 1.6 feet from where the grid operation puts it. In the same run PROJ
 used two different fallbacks for two parts of the same layer. Older data is worse. A NAD27 layer
-that falls back lands 12 feet off, and a 640 acre section that moves 12 feet claims 1.5 acres
+that falls back lands 15 feet off, and a 640 acre section that moves that far claims 2.5 acres
 that belong to its neighbours. Nobody sees this, because no step in the pipeline compares the
 result with anything.
 
@@ -30,9 +30,15 @@ PASS  a zero offset of accuracy 0 is the same datum and is not flagged  <-- pinn
 ...
 PASS  probes of one operation and verdict that miss different grids are separate groups  <-- pinned defect
 ...
+PASS  a grid that is already installed is not listed as needed  <-- pinned defect
+...
 PASS  a prefix --hel of --help is refused  <-- pinned defect
 ...
+PASS  a pyproj older than 3.5, a PROJ older than 9.2, or a pyproj that reports no version exits 2 and names the versions it needs  <-- pinned defect
+...
 PASS  NAD83 to NAD83(2011) without grids is a null shift and exits 1
+...
+PASS  Florida West to North without grids is degraded and exits 3
 ...
 PASS  a default probe that falls offshore on a ballpark offset exits 2 and asks for --point instead of failing a good host  <-- pinned defect
 ...
@@ -40,14 +46,16 @@ PASS  Oahu alone is degraded, Nihoa alone is clean, and the pair exits 3 in eith
 ...
 PASS  a proj4 NAD27 definition whose optional grids are missing does not move the point and exits 1  <-- pinned defect
 ...
-PASS  Florida West to North without grids is degraded and exits 3
-...
 PASS  a control file 30 ft east and 40 ft north reports a 50.00 ftUS miss and 0.3078 acres
+...
+PASS  a probe outside the area of use of the source CRS exits 2  <-- pinned defect
+PASS  a longitude written east of 180 that wraps into the area of use is probed, not refused  <-- pinned defect
+PASS  the default probe of NAD83 to NAD83(2011) lies in the CONUS NADCON5 area, not offshore  <-- pinned defect
 ...
 PASS  a host without the grids refuses to emit control values and writes nothing  <-- pinned defect
 ...
 --------------------------------------------------------------------
-161 assertions, 0 failed
+179 assertions, 0 failed
 ```
 
 ## What already exists
@@ -105,12 +113,18 @@ non-zero when PROJ picks a null-shift operation.
 
 ## Requirements
 
-Python 3.9 or newer, and `pyproj` 3.4 or newer with PROJ 9.1 or newer. 3.4 is the first pyproj with
-`Transformer.get_last_used_operation`. The tool exits 2 and says so when it is missing or too old.
+Python 3.9 or newer, and `pyproj` 3.5 or newer with PROJ 9.2 or newer. The tool exits 2 and names
+both versions when either is older, or when `pyproj` reports no version. `--self-test` needs
+the same stack and also needs pyproj, because half of it runs real PROJ.
 
-`--self-test` also needs pyproj, because half of it runs real PROJ. It needs pyproj 3.5 and PROJ
-9.2 or newer, because it passes `only_best` and expects NADCON5 operations in `proj.db`. On an
-older stack it prints what it needs and exits 2. The check itself still runs there.
+The floor is not arbitrary. The PROJ 9.2.0 release notes list "Added support for NADCON5 grids and
+transformation method" and the `ONLY_BEST` option. pyproj 3.5.0 is the first release built on PROJ
+9.2 (the 3.5.0 wheel reports PROJ 9.2.0, the 3.4.0 wheel PROJ 9.1.0) and the first with
+`only_best`. On pyproj 3.4.0 with PROJ 9.1.0 and no grids, version d25c27e of this tool checked
+`--from EPSG:2236 --to EPSG:6438 --point 600000 1200000`, exited 1 and printed "no more accurate
+operation is known to PROJ here; a grid cannot fix this pair". That sentence is false: four NADCON5
+grids fix the pair, and the Windows host with those grids reports `OK` for it. The exit code was
+right and the advice was wrong, so the tool now refuses the older stack instead.
 
 ```
 python -m pip install pyproj
@@ -121,15 +135,17 @@ Tested on:
 
 | Host | Python | pyproj | PROJ | Self-test |
 |---|---|---|---|---|
-| Windows 11 | 3.13.2 (venv) | 3.8.0 | 9.8.1 | 161 assertions, 0 failed |
-| Windows 11 | 3.13 (`C:\Python313`) | 3.7.2 | 9.5.1 | 161 assertions, 0 failed |
-| Windows 11 | 3.9.25 (venv) | 3.6.1 | 9.3.0 | 161 assertions, 0 failed |
-| Windows 11 | 3.9.25 (venv) | 3.5.0 | 9.2.0 | 161 assertions, 0 failed |
-| Windows 11 | 3.9.25 (venv) | 3.4.0 | 9.1.0 | refused, exit 2; the check runs |
-| Linux (Ubuntu) | 3.12.3 (venv) | 3.8.0 | 9.8.1 | 161 assertions, 0 failed |
+| Windows 11 | 3.13.2 (venv) | 3.8.0 | 9.8.1 | 179 assertions, 0 failed |
+| Windows 11 | 3.13.2 (`C:\Python313`) | 3.7.2 | 9.5.1 | 179 assertions, 0 failed |
+| Windows 11 | 3.9.25 (venv) | 3.6.1 | 9.3.0 | 179 assertions, 0 failed |
+| Windows 11 | 3.9.25 (venv) | 3.5.0 | 9.2.0 | 179 assertions, 0 failed |
+| Windows 11 | 3.9.25 (venv) | 3.4.0 | 9.1.0 | refused, exit 2; the check refuses too |
+| Linux (Ubuntu) | 3.12.3 (venv) | 3.8.0 | 9.8.1 | 179 assertions, 0 failed |
 
-The count is the same on every host that runs the self-test. The pyproj 3.4.0 row ran
-`--from EPSG:2236 --to EPSG:6438 --point 600000 1200000` and exited 1, the same as on the others.
+The count is the same on every host that runs the self-test, because the real PROJ part runs on
+every host with the grids hidden. The pyproj 3.4.0 row ran `--self-test` and the check
+`--from EPSG:2236 --to EPSG:6438 --point 600000 1200000`. Both exited 2 and printed that the stack
+is too old. No host has `arcpy`; the tool does not use it.
 
 ## Quick start
 
@@ -155,8 +171,8 @@ python datumcheck.py --from EPSG:2236 --to EPSG:6438 --emit-control points.csv >
 |---|---|---|
 | `--from CRS` | none | Source CRS, anything pyproj reads, such as `EPSG:2236`. Required. |
 | `--to CRS` | none | Target CRS. Required. |
-| `--point X Y` | centre of both areas of use | A probe point in source CRS units. Two numbers with a space between. Repeat the flag for more points. Pass it for any real check: the default can lie offshore (see Limits). |
-| `--control CSV` | none | Known-good coordinates. Columns `sx,sy,tx,ty`. Adds the miss in feet and acres. The `sx,sy` values are the probes when you pass no `--point`. |
+| `--point X Y` | centre of both areas of use, moved inside the area of the most accurate operation PROJ lists | A probe point in source CRS units. X first: easting, or longitude for a geographic CRS. Two numbers with a space between. Repeat the flag for more points. A point outside the area of use of the source CRS exits 2. Pass it for any real check: the default can lie offshore (see Limits). |
+| `--control CSV` | none | Known-good coordinates. Columns `sx,sy,tx,ty`. Adds the miss in feet and acres. The `sx,sy` values are the probes when you pass no `--point`. For a geographic target the `tx,ty` values must be degrees. |
 | `--emit-control CSV` | none | Read points (columns `sx,sy`) and print control rows to standard output. Refuses unless this host used the best available operation (exit 0). |
 | `--parcel-acres N` | `1.0` | Parcel size for the acres figure. |
 | `--self-test` | off | Run the assertions and exit. |
@@ -173,7 +189,7 @@ are all refused with exit 64.
 |---|---|
 | 0 | PROJ used a real operation at every probe. |
 | 1 | PROJ used a null-shift operation at one probe or more, or skipped a missing optional grid (below). `--self-test` also exits 1 when an assertion fails. |
-| 2 | The check could not run: pyproj missing or old, unknown CRS, unreadable or bad CSV, a point PROJ cannot transform, or a default probe that fell on a ballpark offset (pass `--point`). |
+| 2 | The check could not run: pyproj missing or older than 3.5, PROJ older than 9.2, unknown CRS, unreadable or bad CSV (an empty path counts as unreadable), a point PROJ cannot transform, a point outside the area of use of the source CRS, control values for a geographic target that are not degrees, or a default probe that fell on a ballpark offset (pass `--point`). |
 | 3 | The operation is not a null shift, but a more accurate one needs grids this host lacks. |
 | 64 | Usage error, including an abbreviated or unknown flag. |
 | 70 | A fault in the tool. It is never a finding about your data. |
@@ -223,6 +239,49 @@ change of vertical unit makes PROJ merge the datum step into one step with no pa
 hid a zero shift. `EPSG:6438+5703` to `EPSG:4326+6360` now exits 1, the same as without the
 vertical part.
 
+## Probes and areas of use
+
+PROJ chooses the operation from the position of each point. Its documentation says that
+`proj_trans()` "can compare this coordinate to the area of use of operations", and it lists the
+synthesised ballpark offset with the area "World"
+(<https://proj.org/en/stable/operations/operations_computation.html>). A probe outside the area
+where your data lives can therefore get a different operation than your data gets, and the verdict
+describes the probe, not the data.
+
+Each CRS carries an area of use: a box of west, south, east and north in degrees
+(`CRS.area_of_use` in pyproj, which is `None` when the CRS has none). `EPSG:2236` reports west
+-82.33, south 24.41, east -79.97, north 30.83. `EPSG:4269` reports west 167.65, south 14.92, east
+-40.73, north 86.45: west is greater than east, so the box crosses the antimeridian. datumcheck
+turns each probe into longitude and latitude and exits 2 when it lies outside the box of the
+source CRS. A longitude counts at any multiple of 360 degrees: `--point 200 50` is 160 W, inside the
+`EPSG:4269` box, and is probed.
+
+```
+$ python datumcheck.py --from EPSG:2236 --to EPSG:6438 --point 5000000 5000000
+error: the probe 5000000.0, 5000000.0 lies outside the area of use of the source CRS (west -82.33, south 24.41, east -79.97, north 30.83). PROJ chooses an operation from the position of each point, and out there only a world-wide ballpark offset or an operation made for another place applies, so the verdict would describe the probe, not your data. Give X first (easting, or longitude for a geographic CRS).
+$ echo $?
+2
+```
+
+The same refusal catches a latitude-first point. `--from EPSG:4269 --to EPSG:4326 --point 29.2 -82`
+reads latitude 82 S, outside the box, and exits 2. Version d25c27e of this tool exited 1 for it and
+printed "a grid cannot fix this pair". For the Florida point above the same version, on the Windows
+host with the grids, printed `OK` and exited 0. That was a clean verdict for a place that is not in
+Florida.
+
+The default probe, used when you pass no `--point`, `--control` or `--emit-control`, is the centre
+of the overlap of the two areas of use. When PROJ lists a most accurate operation for the pair, the
+centre is taken inside that operation's box. `EPSG:4269` to `EPSG:6318` now probes -95.85, 36.6,
+in the CONUS NADCON5 area. The overlap centre alone is -128.115, 44.815, in the Pacific off Oregon.
+The most accurate operation is a guess about where you work: for `EPSG:4269` to `EPSG:4326` the
+default is -68.475, 53.805, in Quebec. The operations with the best declared accuracy (1.5 m) are
+`NAD83 to WGS 84 (6)`, `(7)` and `(8)`, for Quebec, Saskatchewan and Alberta, and the widest of those
+boxes wins. Pass `--point` with a place in your data.
+
+Two limits of the box. It is a rectangle, so a point inside it can still be at sea. A point just
+outside it can be good data, and no flag overrides the refusal. A CRS with no area of use, such as
+a proj4 string, is not checked.
+
 ## Error in feet and acres
 
 Grids hide the answer. Without them PROJ cannot say how far the fallback is from the grid result.
@@ -262,19 +321,21 @@ RESULT: NULL SHIFT (exit 1)
 The first point used a zero translation. The other two used a ballpark offset. The report groups
 the probes by operation, so the difference shows.
 
-Results for two pairs, all measured. Both use the three synthetic points above (600000 1200000,
-610000 1210000 and 620000 1220000, read in each pair's own zone), and the last column adds
-`--parcel-acres 640`:
+Results for two pairs, all measured. The Florida East pair uses the three synthetic points above.
+The Florida North pair uses three synthetic points read in its own zone and inside its area of use
+(2069331 523739, 1842206 473103 and 2316543 365046). The last column adds `--parcel-acres 640`:
 
 | Pair | Host | Exit | Worst miss | Acres, 1 acre parcel | Acres, 640 acre parcel |
 |---|---|---|---|---|---|
 | NAD83 to NAD83(2011), Florida East ftUS (`2236` to `6438`) | Linux, no grids | 1 | 1.59 ftUS | 0.0096 | not run |
-| NAD27 to NAD83, Florida North ftUS (`26760` to `2238`) | Linux, no grids | 3 | 12.27 ftUS | 0.0600 | 1.5198 |
+| NAD27 to NAD83, Florida North ftUS (`26760` to `2238`) | Linux, no grids | 3 | 15.06 ftUS | 0.0951 | 2.4562 |
 | both | Windows, grids installed | 0 | 0.00 ftUS | 0.0000 | not run |
 
 The Windows rows prove the control file is sound: with the grids, PROJ reproduces its own truth.
 The NAD27 pair used a chain with a declared accuracy of 14 m and exits 3, not 1, because that
-chain holds real translations.
+chain holds real translations. An earlier version of this table read 12.27 ftUS and 1.5198 acres.
+It read the Florida East points in the Florida North zone, outside the zone's area of use, and the
+area-of-use refusal now rejects those points with exit 2.
 
 ### The units
 
@@ -329,34 +390,36 @@ chain holds real translations.
   and to WGS 84 (`EPSG:4151` to `EPSG:4258` and `EPSG:4326`).
 - Only a grid whose name starts with `@` is checked for a skipped optional grid. A proj4 string
   with `+nadgrids=null` (no `@`) moves nothing and exits 0.
-- An empty `--control ""` or `--emit-control ""` value, such as an unset shell variable, is
-  silently ignored. The run prints no control line and exits by the probe verdict alone.
-- An operation counts as missing when any one of its grids is missing, and the report lists every
-  grid of that operation under `needs`, including grids the host already has. After a partial
-  `projsync` it still advises installing grids you hold. The exit code is right. Measured with 3 of
-  the 4 NADCON5 conus files for `EPSG:2236` to `EPSG:6438` in an otherwise empty
-  `PROJ_USER_WRITABLE_DIRECTORY`: all 4 were listed.
-- The probe takes X first (longitude first for a geographic source). A latitude-first point such
-  as `--point 29.2 -82` is not rejected and probes the wrong place.
-- The default probe is the centre of the overlap of the two areas of use, and the report says so.
-  It can lie offshore or far from your data. For `EPSG:4269` to `EPSG:6318` it is 44.815 N,
-  128.115 W, in the Pacific off Oregon, where PROJ falls back to a ballpark offset even on a host
-  that holds every grid. When the default probe lands on a ballpark offset and no better operation
-  is listed, the run exits 2 and asks for `--point`, instead of failing a good host. A default probe
-  on a declared zero shift still exits 1, because that holds anywhere. For `EPSG:4269` to
-  `EPSG:4326` the default is 50.685 N, 110.365 W, in Canada. Pass `--point` for your own data.
-- A probe outside the area of use of the source CRS is not rejected. The verdict describes PROJ's
-  choice at that place, not at your data. `--from EPSG:2236 --to EPSG:6438 --point 5000000
-  5000000` exits 1 and says that no grid can fix the pair, which is untrue for Florida.
-  A latitude above 90 or a longitude above 180 is reported the same way, not as a bad input.
+- An operation counts as missing when any one of its grids is missing. The report lists only the
+  grids the host lacks. Measured with 3 of the 4 NADCON5 conus files for `EPSG:2236` to
+  `EPSG:6438` in an otherwise empty `PROJ_USER_WRITABLE_DIRECTORY`: one grid was listed,
+  `us_noaa_nadcon5_nad83_harn_nad83_fbn_conus.tif`, and version d25c27e listed all 4. With all 4
+  held the probe reports `OK` and exits 0. The self-test pins the filter with made-up grid records
+  and cannot copy real grids, so the real run above was done by hand.
+- The probe takes X first (longitude first for a geographic source). A latitude-first point is
+  refused only when it lies outside the area of use of the source CRS. `--from EPSG:4326 --to
+  EPSG:4326 --point 29.2 -82` is a valid place in Antarctica and is probed (exit 0, measured).
+- The default probe is a guess about where you work (see "Probes and areas of use"). It can lie
+  offshore or far from your data. For `EPSG:6318` to `EPSG:6783` it is 44.815 N, 128.115 W, in the
+  Pacific off Oregon, where PROJ falls back to a ballpark offset even on a host that holds every
+  grid. When the default probe lands on a ballpark offset and no better operation is listed, the
+  run exits 2 and asks for `--point`, instead of failing a good host. A default probe on a declared
+  zero shift still exits 1, because that holds anywhere. Pass `--point` for your own data.
+- The area of use is a rectangle. A probe inside it can lie at sea, and a probe just outside it can
+  be good data that the tool refuses with exit 2. No flag overrides the refusal. A CRS without an
+  area of use, such as a proj4 string, is not checked, and a probe there can get an operation made
+  for another place.
+- The version gate (pyproj 3.5, PROJ 9.2) tests both versions. A pyproj 3.4 built against a system
+  PROJ 9.2 or newer is refused too. I did not test that stack.
 - `--emit-control` writes `%.6f`. On a geographic target that rounds by about 0.2 ftUS, so reading
   an emitted file back with `--control` shows a small non-zero miss (0.19 ftUS for `EPSG:6318`).
   The zero-miss round trip holds for projected targets only.
 - A control file with a header column twice (`sx,sy,tx,ty,sx`) takes the last value of that column.
   A row with more cells than the header drops the extra cells. Check your header yourself.
-- A geographic target measured against control values in projected units prints `worst miss nan
-  ftUS` and a worst displacement of the whole parcel, and still exits 0 on a host with the grids.
-  Give control values in the target CRS units, X (longitude) first.
+- For a geographic target the `tx,ty` control values must fall in -180 to 360 for X and -90 to 90 for
+  Y, or the run exits 2 and names the row. The test is a range. Degrees written latitude first,
+  such as `29,-82`, are in range and are scored without a warning: the control line then shows a
+  miss of 40 million ftUS and the run still exits 0 on a host with the grids (measured).
 - A cell such as `1_000` is read as 1000, because Python's `float` accepts digit-group underscores.
 - `--emit-control` takes an input file of points, despite its name. In `--emit-control pts.csv >
   truth.csv` the shell truncates an existing `truth.csv` before the tool starts. If this host then
@@ -369,15 +432,16 @@ chain holds real translations.
 - In Windows PowerShell 5.1, `--emit-control pts.csv > truth.csv` writes UTF-16, and the next
   `--control` run exits 2 with a UTF-8 decode error on byte 0xff. Use `| Out-File -Encoding
   ascii` or run the command in cmd.exe.
-- A field larger than 128 KiB in a control or point file makes the csv module raise an error that
-  the tool does not catch as bad input. It exits 70, not 2.
+- A field larger than 128 KiB in a control or point file, or a NUL byte in a number, exits 2 with
+  the line number. Measured with a 200,000 digit field: `line 1: field larger than field limit
+  (131072)`.
 - A fault inside the check that raises `ValueError`, `RuntimeError` or `OSError` is reported as exit
   2, so it cannot be told apart from bad input.
 - An absurd `--parcel-acres`, such as `1e300`, loses precision: the area minus the overlap cancels
   and the report prints `0.0000 acres` for a miss of 49.95 ftUS.
 - The whole control or emit file is read into memory, and each row costs one PROJ transform and one
-  grid lookup, with no cache for a repeated probe. A 200 row file took 2.0 seconds on the Linux
-  host and 2.1 seconds on the Windows venv (one run each). At that rate a 10,000 row file takes
+  grid lookup, with no cache for a repeated probe. A 200 row file took 1.9 seconds on the Linux
+  host and 1.9 seconds on the Windows venv (two runs each). At that rate a 10,000 row file takes
   about 100 seconds; I did not run it.
 - It does not test ArcGIS Pro, ArcGIS Server or any Esri geoprocessing. Those use their own
   transformation engine. It checks the PROJ stack that pyproj, geopandas and GDAL builds use.
@@ -387,10 +451,11 @@ chain holds real translations.
   environment variable page. If a future PROJ drops
   it, the self-test fails on its isolation check instead of passing with grids present. Grids
   in PROJ's data directory stay visible. With the data directory pointed at a folder that holds
-  grids (a conda install with `proj-data`), 13 assertions failed on 2026-10-29 (Linux conda
-  environment, Python 3.12.14, pyproj 3.8.0, PROJ 9.8.1, 387 `.tif` files). The count follows the
-  grids and the tool version. The check itself is
-  unaffected.
+  grids (a conda install with `proj-data`), 11 assertions failed on 2026-11-11 (Windows venv, Python
+  3.13.2, pyproj 3.8.0, PROJ 9.8.1, `pyproj.datadir.set_data_dir()` pointed at a copy of the PROJ
+  data directory plus 20 `.tif` grids). An earlier version of the tool failed 13 on a Linux conda
+  environment with 387 `.tif` files. The count follows the grids and the tool version. The check
+  itself is unaffected.
 - The self-test's `PROJ_NETWORK=ON` assertions fail when an HTTP proxy variable such as
   `http_proxy` is set without a 127.0.0.1 `no_proxy` entry, because libcurl sends the loopback
   request to the proxy. Measured with `http_proxy=http://127.0.0.1:9`: 2 assertions failed.
@@ -402,11 +467,11 @@ chain holds real translations.
   the file from git, or run `python3 datumcheck.py`.
 - The Oahu pair (`EPSG:4152` to `EPSG:4269`) exits 3 only on a host whose PROJ user directory lacks
   `us_noaa_hihpgn.tif`. With that grid installed, the same probe exits 1 on a Ballpark step.
-- Branch coverage is 100 percent (798 statements, 140 branches, coverage 7.16.1 on the Windows
-  venv), from `coverage run --branch datumcheck.py --self-test`. No line is excluded. The network
-  lines run against the loopback stub. The Windows venv, `C:\Python313` and Linux all run the same
-  161 assertions, because the real PROJ part runs on every host with the grids hidden. Linux
-  coverage was not measured.
+- Branch coverage is 100 percent on both hosts, from `coverage run --branch datumcheck.py
+  --self-test`: 888 statements and 166 branches on the Windows venv (coverage 7.16.1) and the same
+  888 and 166 on Linux (coverage 7.17.0), with none missed or partly covered. No line is excluded.
+  The network lines run against the loopback stub. All hosts run the same 179 assertions, because
+  the real PROJ part runs on every host with the grids hidden.
 
 ## Sources checked
 
@@ -422,6 +487,15 @@ chain holds real translations.
 - Search order of grid directories, the Windows and Linux user-writable directory:
   <https://proj.org/en/stable/resource_files.html>
 - `PROJ_NETWORK`: <https://proj.org/en/stable/usage/environmentvars.html>
+- `CRS.area_of_use`, which is `None` when a CRS has none:
+  <https://pyproj4.github.io/pyproj/stable/api/crs/crs.html>
+- `proj_get_area_of_use`, the box in degrees and the unknown value -1000:
+  <https://proj.org/en/stable/development/reference/functions.html>
+- `proj_trans()` compares the coordinate with the area of use of operations, and the ballpark
+  operation covers "World": <https://proj.org/en/stable/operations/operations_computation.html>
+- `Grid.available` of an operation's grids:
+  <https://pyproj4.github.io/pyproj/stable/api/crs/coordinate_operation.html>
+- PROJ 9.2.0 release notes, NADCON5 and `ONLY_BEST`: <https://proj.org/en/stable/news.html>
 - Optional grids, the `@` prefix:
   <https://proj.org/en/stable/operations/transformations/hgridshift.html> and
   <https://proj.org/en/stable/usage/transformation.html>
