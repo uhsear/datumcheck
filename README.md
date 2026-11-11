@@ -7,13 +7,15 @@ A nightly job on a Linux server reprojects a parcel layer from NAD83 to NAD83(20
 The Python there came from `pip install pyproj`. The job logs no warning and exits 0. The output
 looks right on a map.
 
-It is not right. The pip wheel carries no datum grids, so PROJ could not use the operation that
-needs one. It fell back to a zero translation, or to a "ballpark" offset that moves nothing.
-Every point landed about 1.6 feet from where the grid operation puts it. In the same run PROJ
-used two different fallbacks for two parts of the same layer. Older data is worse. A NAD27 layer
-that falls back lands 15 feet off, and a 640 acre section that moves that far claims 2.5 acres
-that belong to its neighbours. Nobody sees this, because no step in the pipeline compares the
-result with anything.
+It is not right. The pip wheel carries no datum grids, so PROJ cannot use the operation that
+needs one. It falls back to a zero translation, or to a "ballpark" offset that moves nothing.
+The figures below come from synthetic points on a Linux host with no grids (see "Error in feet
+and acres"), not from a production layer. For NAD83 to NAD83(2011) in Florida East, every point
+lands about 1.6 feet from where the grid operation puts it. In the same run PROJ used two
+different fallbacks for different points of the same layer. Older data is worse. A NAD27 layer
+that falls back lands about 15 feet off, and a 640 acre section that moves that far claims about
+2.5 acres that belong to its neighbours. Nobody sees this, because no step in the pipeline
+compares the result with anything.
 
 This tool asks PROJ which operation it used for real points, and refuses when that operation
 shifts nothing. Give it a control file of known-good coordinates and it also says how far off the
