@@ -51,13 +51,15 @@ PASS  a proj4 NAD27 definition whose optional grids are missing does not move th
 PASS  a control file 30 ft east and 40 ft north reports a 50.00 ftUS miss and 0.3078 acres
 ...
 PASS  a probe outside the area of use of the source CRS exits 2  <-- pinned defect
+...
+PASS  a latitude-first --point from EPSG:4326 to EPSG:4267 exits 2, not a false NULL SHIFT  <-- pinned defect
 PASS  a longitude written east of 180 that wraps into the area of use is probed, not refused  <-- pinned defect
 PASS  the default probe of NAD83 to NAD83(2011) lies in the CONUS NADCON5 area, not offshore  <-- pinned defect
 ...
 PASS  a host without the grids refuses to emit control values and writes nothing  <-- pinned defect
 ...
 --------------------------------------------------------------------
-179 assertions, 0 failed
+183 assertions, 0 failed
 ```
 
 ## What already exists
@@ -137,12 +139,12 @@ Tested on:
 
 | Host | Python | pyproj | PROJ | Self-test |
 |---|---|---|---|---|
-| Windows 11 | 3.13.2 (venv) | 3.8.0 | 9.8.1 | 179 assertions, 0 failed |
-| Windows 11 | 3.13.2 (`C:\Python313`) | 3.7.2 | 9.5.1 | 179 assertions, 0 failed |
-| Windows 11 | 3.9.25 (venv) | 3.6.1 | 9.3.0 | 179 assertions, 0 failed |
-| Windows 11 | 3.9.25 (venv) | 3.5.0 | 9.2.0 | 179 assertions, 0 failed |
-| Windows 11 | 3.9.25 (venv) | 3.4.0 | 9.1.0 | refused, exit 2; the check refuses too |
-| Linux (Ubuntu) | 3.12.3 (venv) | 3.8.0 | 9.8.1 | 179 assertions, 0 failed |
+| Windows 11 | 3.13.2 (venv) | 3.8.0 | 9.8.1 | 183 assertions, 0 failed |
+| Windows 11 | 3.13.2 (`C:\Python313`) | 3.7.2 | 9.5.1 | 183 assertions, 0 failed |
+| Linux (Ubuntu) | 3.12.3 (venv) | 3.8.0 | 9.8.1 | 183 assertions, 0 failed |
+| Linux (Ubuntu) | 3.9.25 (venv) | 3.6.1 | 9.3.0 | 183 assertions, 0 failed |
+| Linux (Ubuntu) | 3.9.25 (venv) | 3.5.0 | 9.2.0 | 183 assertions, 0 failed |
+| Linux (Ubuntu) | 3.9.25 (venv) | 3.4.0 | 9.1.0 | refused, exit 2; the check refuses too |
 
 The count is the same on every host that runs the self-test, because the real PROJ part runs on
 every host with the grids hidden. The pyproj 3.4.0 row ran `--self-test` and the check
@@ -267,7 +269,7 @@ $ echo $?
 
 The same refusal catches a latitude-first point. `--from EPSG:4269 --to EPSG:4326 --point 29.2 -82`
 reads latitude 82 S, outside the box, and exits 2. Version d25c27e of this tool exited 1 for it and
-printed "a grid cannot fix this pair". For the Florida point above the same version, on the Windows
+printed "a grid cannot fix this pair". For the probe 5000000 5000000 the same version, on the Windows
 host with the grids, printed `OK` and exited 0. That was a clean verdict for a place that is not in
 Florida.
 
@@ -399,8 +401,24 @@ area-of-use refusal now rejects those points with exit 2.
   held the probe reports `OK` and exits 0. The self-test pins the filter with made-up grid records
   and cannot copy real grids, so the real run above was done by hand.
 - The probe takes X first (longitude first for a geographic source). A latitude-first point is
-  refused only when it lies outside the area of use of the source CRS. `--from EPSG:4326 --to
-  EPSG:4326 --point 29.2 -82` is a valid place in Antarctica and is probed (exit 0, measured).
+  refused when it lies outside the area of use of the source CRS. A world-wide source such as
+  `EPSG:4326` has no such limit, so the area of use of the target CRS is checked instead:
+  `--from EPSG:4326 --to EPSG:4269 --point 29.2 -82` exits 2. When both CRS are world-wide,
+  `--from EPSG:4326 --to EPSG:4326 --point 29.2 -82` is a valid place in Antarctica and is probed
+  (exit 0, measured).
+- Only the source area of use is checked, except for a world-wide source. A probe inside the
+  source area but outside the target area is probed anyway, because data in one zone may move into
+  a zone that does not cover it. Its verdict describes that place. For example `--from EPSG:4269
+  --to EPSG:6438 --point -100 40` (Kansas, Florida East target) prints `OK` and exits 0.
+- For pairs with several regional operations the default probe can be in another country, so a
+  gating job should always pass `--point`. `EPSG:4269` to `EPSG:4326` probes Quebec.
+- The `--from` and `--to` text is printed in the report header and in the CRS error message, so
+  never put credentials in it.
+- Python may write its own bytecode cache for the standard library on first import. datumcheck
+  writes no file itself.
+- Exit 1 from `--self-test` means an assertion failed, not that a null shift was found. Run the
+  self-test as a separate step.
+- A control file header is case sensitive: `SX,SY,TX,TY` exits 2 with a missing column message.
 - The default probe is a guess about where you work (see "Probes and areas of use"). It can lie
   offshore or far from your data. For `EPSG:6318` to `EPSG:6783` it is 44.815 N, 128.115 W, in the
   Pacific off Oregon, where PROJ falls back to a ballpark offset even on a host that holds every
@@ -490,11 +508,11 @@ area-of-use refusal now rejects those points with exit 2.
   missing operation. A pair could exit 0 on a known-accuracy fallback while such a grid is
   missing. I searched 310 geographic CRS pairs with `TransformerGroup` and found no real case.
 - The system `python3` on the Linux host has no pyproj, so `python3 datumcheck.py --self-test` there
-  exits 2 and prints no PASS lines. The 179 assertion result needs a virtual environment with pyproj.
+  exits 2 and prints no PASS lines. The 183 assertion result needs a virtual environment with pyproj.
 - Branch coverage is 100 percent on both hosts, from `coverage run --branch datumcheck.py
-  --self-test`: 888 statements and 166 branches on the Windows venv (coverage 7.16.1) and the same
-  888 and 166 on Linux (coverage 7.17.2), with none missed or partly covered. No line is excluded.
-  The network lines run against the loopback stub. All hosts run the same 179 assertions, because
+  --self-test`: 902 statements and 172 branches on the Windows venv (coverage 7.16.1) and the same
+  902 and 172 on Linux (coverage 7.17.2), with none missed or partly covered. No line is excluded.
+  The network lines run against the loopback stub. All hosts run the same 183 assertions, because
   the real PROJ part runs on every host with the grids hidden.
 
 ## Sources checked

@@ -382,6 +382,11 @@ def in_area(lon, lat, bounds):
     return any(west <= lon + shift <= east for shift in (-360.0, 0.0, 360.0))
 
 
+def is_global(bounds):
+    """True when a (west, south, east, north) box covers the whole globe."""
+    return bounds is not None and bounds[0] <= -180.0 and bounds[1] <= -90.0         and bounds[2] >= 180.0 and bounds[3] >= 90.0
+
+
 def wrap_lon(lon):
     """A longitude in degrees as a number in (-180, 180]. PROJ 9.2 and 9.3 on
     Windows died with a stack overflow when asked for the operations in a box
@@ -572,15 +577,23 @@ def probe_one(pyproj, ctx, x, y):
                          "is outside what the source CRS supports, or a grid "
                          "it needs could not be read." % (x, y))
     lon, lat = ctx["to_lonlat"].transform(x, y)
-    if ctx["bounds"] is not None and not in_area(lon, lat, ctx["bounds"]):
-        raise ValueError(
-            "the probe %r, %r lies outside the area of use of the source CRS "
-            "(west %g, south %g, east %g, north %g). PROJ chooses an "
-            "operation from the position of each point, and out there only a "
-            "world-wide ballpark offset or an operation made for another "
-            "place applies, so the verdict would describe the probe, not "
-            "your data. Give X first (easting, or longitude for a geographic "
-            "CRS)." % ((x, y) + tuple(ctx["bounds"])))
+    # A world-wide source (EPSG:4326) cannot refuse a latitude-first point, so
+    # the target area stands in. Otherwise only the source is checked: data
+    # in one zone may be moved into a zone that does not cover it.
+    checks = [("source", ctx["bounds"], (lon, lat))]
+    if is_global(ctx["bounds"]):
+        checks = [("target", ctx["dst_bounds"],
+                   ctx["dst_lonlat"].transform(gx, gy))]
+    for role, bounds, where in checks:
+        if bounds is not None and not in_area(where[0], where[1], bounds):
+            raise ValueError(
+                "the probe %r, %r lies outside the area of use of the %s "
+                "CRS (west %g, south %g, east %g, north %g). PROJ chooses an "
+                "operation from the position of each point, and out there "
+                "only a world-wide ballpark offset or an operation made for "
+                "another place applies, so the verdict would describe the "
+                "probe, not your data. Give X first (easting, or longitude "
+                "for a geographic CRS)." % ((x, y, role) + tuple(bounds)))
     try:
         op = ctx["tf"].get_last_used_operation()
     except pyproj.exceptions.ProjError:
@@ -690,8 +703,13 @@ def run_check(args, out):
     ctx = {"src": src, "dst": dst, "tf": tf,
            "bounds": None if area is None else
            (area.west, area.south, area.east, area.north),
+           "dst_bounds": None if dst.area_of_use is None else
+           (dst.area_of_use.west, dst.area_of_use.south,
+            dst.area_of_use.east, dst.area_of_use.north),
            "to_lonlat": pyproj.Transformer.from_crs(
-               src, "EPSG:4326", always_xy=True)}
+               src, "EPSG:4326", always_xy=True),
+           "dst_lonlat": pyproj.Transformer.from_crs(
+               dst, "EPSG:4326", always_xy=True)}
 
     control = parse_rows(read_text(args.control), CONTROL_COLUMNS) \
         if args.control is not None else []
@@ -1541,7 +1559,8 @@ def _self_test(tmp, user_dir):
           "miss and 0.3078 acres")
     check(listing() == before,
           "checking against a control file writes nothing")
-    bom = write("bom.csv", chr(0xFEFF) + open(control).read())
+    with open(control, encoding="utf-8") as handle:
+        bom = write("bom.csv", chr(0xFEFF) + handle.read())
     code, out, err = run_cli(base + ["--control", bom])
     check(code == 3 and "worst miss 50.00 ftUS" in out,
           "a control file saved by Excel with a byte order mark reads the "
@@ -1596,6 +1615,23 @@ def _self_test(tmp, user_dir):
                        "--point", "5000000", "5000000"])[0] == 2,
           "a probe outside the area of use of the source CRS exits 2  "
           "<-- pinned defect")
+    # EPSG:4326 covers the world, so the target area has to catch the same
+    # mistake; the intended order is probed and gets a real verdict
+    for target in ("EPSG:4269", "EPSG:6318", "EPSG:4267"):
+        world = ["--from", "EPSG:4326", "--to", target]
+        code, out, err = run_cli(world + ["--point", "29.2", "-82"])
+        good = run_cli(world + ["--point", "-82", "29.2"])
+        check(code == 2 and "area of use of the target CRS" in err
+              and "Give X first" in err and good[0] != 2
+              and "area of use" not in good[2],
+              "a latitude-first --point from EPSG:4326 to %s exits 2, not a "
+              "false NULL SHIFT  <-- pinned defect" % target)
+    legacy_dst = "+proj=longlat +ellps=GRS80 +towgs84=0,0,0 +no_defs"
+    check("area of use" not in run_cli(
+        ["--from", "EPSG:4326", "--to", legacy_dst, "--point", "29.2",
+         "-82"])[2],
+          "a world-wide source and a target with no area of use is probed, "
+          "not refused  <-- pinned defect")
     # 200 E is 160 W: inside the area, which crosses the antimeridian
     code, out, err = run_cli(geo_pair + ["--point", "200", "50"])
     check(code in (1, 3) and "outside the area of use" not in err,
