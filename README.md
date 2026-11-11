@@ -200,7 +200,7 @@ A Python crash before the tool starts, such as an interpreter too old to compile
 exits 1. Read the output text, or run `--self-test` as a separate step.
 
 If a probe is 1 and another is 3, the run exits 1. Code 3 is not code 1, so a gate that tests only
-for 1 passes the NAD27 fallback that lands about 12 feet off. Treat any non-zero code as a failure.
+for 1 passes the NAD27 fallback that lands about 15 feet off. Treat any non-zero code as a failure.
 
 ## What counts as a null shift
 
@@ -375,7 +375,7 @@ area-of-use refusal now rejects those points with exit 2.
   part.
 - Exit 0 means only that PROJ used no null-shift operation and knows of no better one that is
   missing. It never means that the control file agrees. With a control file the miss is reported
-  but never gated: a control row 50 ft off still prints `worst miss 49.95 ftUS` and exits 0 on a
+  but never gated: a control row 50 ft off still prints `worst miss 50.00 ftUS` and exits 0 on a
   host with the grids. This holds for a bad control file too, such as swapped columns or values
   in the wrong units. The closing `RESULT:` line does not mention the control result, so read the
   `control:` line too.
@@ -431,7 +431,7 @@ area-of-use refusal now rejects those points with exit 2.
 - Control, point and emit files must be UTF-8, and a byte order mark is accepted. A file in
   a legacy code page, such as cp1252 with an accented letter, stops the run with exit 2. A header
   such as `sx, sy`, with a space after the comma, stops the run with a missing-column error.
-- In Windows PowerShell 5.1, `--emit-control pts.csv > truth.csv` writes UTF-16, and the next
+- In Windows PowerShell 5.1, `--emit-control pts.csv > truth.csv` writes UTF-16 (measured), and the next
   `--control` run exits 2 with a UTF-8 decode error on byte 0xff. Use `| Out-File -Encoding
   ascii` or run the command in cmd.exe.
 - A field larger than 128 KiB in a control or point file, or a NUL byte in a number, exits 2 with
@@ -440,13 +440,14 @@ area-of-use refusal now rejects those points with exit 2.
 - A fault inside the check that raises `ValueError`, `RuntimeError` or `OSError` is reported as exit
   2, so it cannot be told apart from bad input.
 - An absurd `--parcel-acres`, such as `1e300`, loses precision: the area minus the overlap cancels
-  and the report prints `0.0000 acres` for a miss of 49.95 ftUS.
+  and the report prints `0.0000 acres` for a miss of 50.00 ftUS. `1e200` prints a large negative
+  displacement instead.
 - The whole control or emit file is read into memory, and each row costs one PROJ transform and one
   grid lookup, with no cache for a repeated probe. A 200 row file took 1.9 seconds on the Linux
   host and 1.9 seconds on the Windows venv (two runs each). At that rate a 10,000 row file takes
   about 100 seconds; I did not run it.
-- It does not test ArcGIS Pro, ArcGIS Server or any Esri geoprocessing. Those use their own
-  transformation engine. It checks the PROJ stack that pyproj, geopandas and GDAL builds use.
+- It does not test ArcGIS Pro, ArcGIS Server or any Esri geoprocessing. It checks only the PROJ
+  stack that pyproj, geopandas and GDAL builds use.
 - The self-test hides only the grids in PROJ's user directory, by setting
   `PROJ_USER_WRITABLE_DIRECTORY` before PROJ loads. The PROJ source marks it with the
   comment "For testing purposes only" (`src/filemanager.cpp`), and it is not on the official
@@ -467,8 +468,29 @@ area-of-use refusal now rejects those points with exit 2.
   shebang `#!/usr/bin/env python` fails there unless `python-is-python3` is installed. A Windows
   checkout with `core.autocrlf=true` holds CRLF line endings, which break the shebang on Linux. Copy
   the file from git, or run `python3 datumcheck.py`.
-- The Oahu pair (`EPSG:4152` to `EPSG:4269`) exits 3 only on a host whose PROJ user directory lacks
-  `us_noaa_hihpgn.tif`. With that grid installed, the same probe exits 1 on a Ballpark step.
+- The Oahu pair (`EPSG:4152` to `EPSG:4269`) depends on the host. On a host with no grids it exits 3.
+  On the Windows host with grids but without `us_noaa_hihpgn.tif`, the probe at -157.86 21.31 exits
+  1 with a Ballpark step. I could not fetch that grid offline, so I did not test the host that has it.
+- The default probe can print a coordinate with floating-point noise in the last digits, such as
+  `-95.85000000000002`. The value is correct.
+- Any pair from NAD83(2011), WGS 84 or another zero-translation EPSG datum into the web-map CRS
+  `EPSG:3857` exits 1 on any host, for the same reason as the bullet above. Measured for
+  `EPSG:6318` to `EPSG:3857` at -82 29.
+- A vertical-only CRS such as `EPSG:5703` exits 2, because the tool checks the horizontal move only.
+  Give a horizontal or compound CRS.
+- Control and point files are echoed in errors. A header problem prints the first
+  line of the file, and a bad cell prints the cell. Do not point `--control` or `--emit-control` at
+  a file that holds secrets, and keep CI logs of an exit 2 private.
+- The report header prints the `--from` and `--to` text as given. Pass CRS text that holds no
+  credentials, such as a URL with a user name and password.
+- A closed stdout pipe, such as piping the report to `head`, can replace a finding code of 1 or 3
+  with another code. Measured on the Windows venv with the pipe closed before the run: exit 120.
+  Do not truncate the output of a gating run.
+- An operation that PROJ lists with unknown accuracy is ignored when the tool looks for a better
+  missing operation. A pair could exit 0 on a known-accuracy fallback while such a grid is
+  missing. I searched 310 geographic CRS pairs with `TransformerGroup` and found no real case.
+- The system `python3` on the Linux host has no pyproj, so `python3 datumcheck.py --self-test` there
+  exits 2 and prints no PASS lines. The 179 assertion result needs a virtual environment with pyproj.
 - Branch coverage is 100 percent on both hosts, from `coverage run --branch datumcheck.py
   --self-test`: 888 statements and 166 branches on the Windows venv (coverage 7.16.1) and the same
   888 and 166 on Linux (coverage 7.17.0), with none missed or partly covered. No line is excluded.
