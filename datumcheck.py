@@ -152,6 +152,18 @@ def summarize_misses(misses, parcel_acres):
             "worst_acres": max(acres), "parcel_acres": parcel_acres}
 
 
+def is_null_grid(value):
+    """True when a parameter names only PROJ's built-in "null" grid.
+
+    PROJ ships a grid called "null" that shifts nothing anywhere (see the
+    "Geodetic transformation" page). "+nadgrids=null" is a datum step that
+    cannot move a point. A list such as "conus,null" is not null: its other
+    grids do shift.
+    """
+    return isinstance(value, str) and all(
+        name == "null" for name in value.split(","))
+
+
 def is_null_step(step, op_accuracy):
     """True when one step of an operation moves nothing.
 
@@ -159,7 +171,8 @@ def is_null_step(step, op_accuracy):
     when it is a transformation whose every parameter is the number zero.
     An operation PROJ states to be exact (accuracy 0) is the same datum seen
     twice, and a zero there is correct, not a fallback. A grid step carries a
-    file name, which is a string, so it is never zero.
+    file name, which is a string, so it is never zero, except for PROJ's
+    built-in "null" grid.
     """
     if step.get("type") != "Transformation":
         return False
@@ -172,6 +185,8 @@ def is_null_step(step, op_accuracy):
         return False
     for param in params:
         value = param.get("value")
+        if is_null_grid(value):
+            continue
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return False
         if value != 0:
@@ -784,7 +799,8 @@ def _parse(argv):
                     metavar=("X", "Y"),
                     help="a probe point in source CRS units, two numbers "
                          "with a space between; repeatable. Default: the "
-                         "centre of both areas of use")
+                         "centre of both areas of use, moved inside the "
+                         "area of the most accurate operation")
     ap.add_argument("--control", metavar="CSV",
                     help="known-good coordinates, columns sx,sy,tx,ty")
     ap.add_argument("--emit-control", dest="emit_control", metavar="CSV",
@@ -989,6 +1005,17 @@ def _self_test(tmp, user_dir):
           "a translation with real values is not a null shift")
     check(not is_null_step(grid, 0.05),
           "a grid step carries a file name and is not a null shift")
+    check(is_null_step(step("x", ["null"]), -1.0)
+          and is_null_step(step("x", ["null,null"]), -1.0)
+          and not is_null_step(step("x", ["null"]), 0.0),
+          "a datum step whose only grid is PROJ's built-in null grid is a "
+          "null shift  <-- pinned defect")
+    check(not is_null_step(step("x", ["conus,null"]), -1.0)
+          and not is_null_step(step("x", ["nullgrid.gsb"]), -1.0)
+          and not is_null_step(step("x", ["NULL"]), -1.0)
+          and not is_null_step(step("x", ["null", 1.5]), -1.0),
+          "a list that holds a real grid, a longer name or a real number "
+          "beside null is not a null shift")
     check(not is_null_step(proj, 1.0),
           "a map projection step is not a datum step")
     check(not is_null_step({"type": "Transformation", "name": "x"}, 1.0),
@@ -1523,6 +1550,12 @@ def _self_test(tmp, user_dir):
           and "a grid cannot fix" not in out,
           "a proj4 NAD27 definition whose optional grids are missing does not "
           "move the point and exits 1  <-- pinned defect")
+    code, out, err = run_cli(["--from", "+proj=longlat +datum=NAD27 "
+                              "+nadgrids=null +no_defs", "--to", "EPSG:4269",
+                              "--point", "-82", "29"])
+    check(code == 1 and "RESULT: NULL SHIFT (exit 1)" in out,
+          "a proj4 NAD27 definition with +nadgrids=null moves nothing and "
+          "exits 1, not 0  <-- pinned defect")
     code, out, err = run_cli(["--from", "+proj=utm +zone=17 +datum=NAD27 "
                               "+nadgrids=@conus +no_defs", "--to", "EPSG:4269",
                               "--point", "400000", "3200000"])

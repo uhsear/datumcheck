@@ -191,7 +191,7 @@ are all refused with exit 64.
 
 | Code | Meaning |
 |---|---|
-| 0 | PROJ used a real operation at every probe. |
+| 0 | PROJ used a real operation at every probe. It never means the control file agrees: read the `control:` line. |
 | 1 | PROJ used a null-shift operation at one probe or more, or skipped a missing optional grid (below). `--self-test` also exits 1 when an assertion fails. |
 | 2 | The check could not run: pyproj missing or older than 3.5, PROJ older than 9.2, unknown CRS, unreadable or bad CSV (an empty path counts as unreadable), a point PROJ cannot transform, a point outside the area of use of the source CRS, control values for a geographic target that are not degrees, or a default probe that fell on a ballpark offset (pass `--point`). |
 | 3 | The operation is not a null shift, but a more accurate one needs grids this host lacks. |
@@ -211,7 +211,11 @@ nothing when:
 
 - its name starts with `Ballpark`, which is how PROJ names an offset it made up, or
 - it is a transformation whose every parameter is the number zero. `NAD83 to NAD83(2011) (1)`
-  is one. It is an EPSG entry with a declared accuracy of 1 m and three zero translations.
+  is one. It is an EPSG entry with a declared accuracy of 1 m and three zero translations, or
+- its only grid is PROJ's built-in `null` grid, as in `+nadgrids=null`. PROJ documents that file
+  as "a zero shift for the whole world"
+  (<https://proj.org/en/stable/usage/transformation.html>). A list such as `+nadgrids=conus,null`
+  is not null, because the other grid shifts.
 
 An operation is a null shift when it has datum steps and all of them move nothing. A chain that
 holds one real step, such as the Helmert from `NAD83(HARN) to WGS 84 (3)`, is not a null shift.
@@ -228,7 +232,7 @@ The lookup of the unavailable operations runs for every probe, in a box of 0.01 
 because one operation name can cover regions with different grids. At Oahu, `EPSG:4152` to
 `EPSG:4269` needs two missing grids and exits 3. At Nihoa the same operation name needs none and
 exits 0. The self-test pins that the pair exits 3 in either order. The lookup costs about 10 ms
-per probe: a 200 row file took 2.0 seconds on the Linux host.
+per probe: a 200 row file took about 2 seconds on both hosts (see Limits).
 
 A proj4 string can name its grids, as in `+nadgrids=@conus,@alaska`. PROJ treats a grid with a
 leading `@` as optional and does not complain when it is missing
@@ -362,7 +366,8 @@ area-of-use refusal now rejects those points with exit 2.
 - Probes that share an operation but differ in verdict or in missing grids are reported as separate
   groups, so the advice of one probe is never reused for another.
 - datumcheck makes no network call of its own. PROJ's network mode (`PROJ_NETWORK=ON`) is outside
-  it. With the network on and an endpoint that cannot be reached (tested with `http://127.0.0.1:9`),
+  it. With the network on and an endpoint that cannot be reached (run by hand with
+  `PROJ_NETWORK_ENDPOINT=http://127.0.0.1:9`, which the self-test does not cover),
   the run exits 2 and its message says the grid could not be read. The self-test runs the tool once with it on, against a stub `http.server` on 127.0.0.1 that
   answers 404 to every request. PROJ asked the stub only for `.tif` grid files and wrote `cache.db`.
   No grid was ever fetched, so the self-test does not show what a real fetch changes. If you enable
@@ -392,8 +397,9 @@ area-of-use refusal now rejects those points with exit 2.
   (1)` (declared accuracy 4 m) and exited 1. Other operations that EPSG declares as zero shifts
   also exit 1 on any host: RGF93 v1 to ETRS89 (`EPSG:4171` to `EPSG:4258`), and CHTRS95 to ETRS89
   and to WGS 84 (`EPSG:4151` to `EPSG:4258` and `EPSG:4326`).
-- Only a grid whose name starts with `@` is checked for a skipped optional grid. A proj4 string
-  with `+nadgrids=null` (no `@`) moves nothing and exits 0.
+- A skipped optional grid is found by its `@` prefix, and the `null` grid by its name. A required
+  grid that is missing makes PROJ refuse the definition, which exits 2. The `+nadgrids=conus,null`
+  case exits 2 on a host without the `conus` file (measured).
 - An operation counts as missing when any one of its grids is missing. The report lists only the
   grids the host lacks. Measured with 3 of the 4 NADCON5 conus files for `EPSG:2236` to
   `EPSG:6438` in an otherwise empty `PROJ_USER_WRITABLE_DIRECTORY`: one grid was listed,
@@ -409,7 +415,9 @@ area-of-use refusal now rejects those points with exit 2.
 - Only the source area of use is checked, except for a world-wide source. A probe inside the
   source area but outside the target area is probed anyway, because data in one zone may move into
   a zone that does not cover it. Its verdict describes that place. For example `--from EPSG:4269
-  --to EPSG:6438 --point -100 40` (Kansas, Florida East target) prints `OK` and exits 0.
+  --to EPSG:6438 --point -100 40` (Kansas, Florida East target) prints `OK` and exits 0 on a host
+  that holds the NADCON5 grids. On a host without them it prints `NULL SHIFT` with a Ballpark
+  offset and exits 1 (measured both ways), so the verdict follows the host as well as the place.
 - For pairs with several regional operations the default probe can be in another country, so a
   gating job should always pass `--point`. `EPSG:4269` to `EPSG:4326` probes Quebec.
 - The `--from` and `--to` text is printed in the report header and in the CRS error message, so
@@ -428,11 +436,16 @@ area-of-use refusal now rejects those points with exit 2.
 - The area of use is a rectangle. A probe inside it can lie at sea, and a probe just outside it can
   be good data that the tool refuses with exit 2. No flag overrides the refusal. A CRS without an
   area of use, such as a proj4 string, is not checked, and a probe there can get an operation made
-  for another place.
+  for another place. A latitude-first point is then not refused either: `--from '+proj=longlat
+  +datum=NAD83 +no_defs' --to EPSG:4269 --point 29.2 -82` exits 0 with only an axis-order step
+  (measured).
+- When a control or emit row falls outside the area of use of the source CRS, the error shows the
+  coordinates, not the line number.
 - The version gate (pyproj 3.5, PROJ 9.2) tests both versions. A pyproj 3.4 built against a system
   PROJ 9.2 or newer is refused too. I did not test that stack.
-- `--emit-control` writes `%.6f`. On a geographic target that rounds by about 0.2 ftUS, so reading
-  an emitted file back with `--control` shows a small non-zero miss (0.19 ftUS for `EPSG:6318`).
+- `--emit-control` writes `%.6f`. On a geographic target that rounds by up to about 0.2 ftUS, so
+  reading an emitted file back with `--control` shows a small non-zero miss (measured 0.10 to 0.20
+  ftUS, depending on the CRS pair and the points).
   The zero-miss round trip holds for projected targets only.
 - A control file with a header column twice (`sx,sy,tx,ty,sx`) takes the last value of that column.
   A row with more cells than the header drops the extra cells. Check your header yourself.
@@ -440,6 +453,9 @@ area-of-use refusal now rejects those points with exit 2.
   Y, or the run exits 2 and names the row. The test is a range. Degrees written latitude first,
   such as `29,-82`, are in range and are scored without a warning: the control line then shows a
   miss of 40 million ftUS and the run still exits 0 on a host with the grids (measured).
+- A geographic target in grads or another non-degree angle unit, such as `EPSG:4807`, is not
+  supported: `--emit-control` writes grads (54.277855 for latitude 48.85), the range test accepts
+  them as degrees, and the miss in feet is wrong.
 - A cell such as `1_000` is read as 1000, because Python's `float` accepts digit-group underscores.
 - `--emit-control` takes an input file of points, despite its name. In `--emit-control pts.csv >
   truth.csv` the shell truncates an existing `truth.csv` before the tool starts. If this host then
@@ -461,8 +477,9 @@ area-of-use refusal now rejects those points with exit 2.
   and the report prints `0.0000 acres` for a miss of 50.00 ftUS. `1e200` prints a large negative
   displacement instead.
 - The whole control or emit file is read into memory, and each row costs one PROJ transform and one
-  grid lookup, with no cache for a repeated probe. A 200 row file took 1.9 seconds on the Linux
-  host and 1.9 seconds on the Windows venv (two runs each). At that rate a 10,000 row file takes
+  grid lookup, with no cache for a repeated probe. A 200 row file (`EPSG:2236` to
+  `EPSG:6438`, `--emit-control`) took 1.9 seconds on the Linux host and 2.0 seconds on the Windows
+  venv (two runs each, measured 2026-11-11). At that rate a 10,000 row file takes
   about 100 seconds; I did not run it.
 - It does not test ArcGIS Pro, ArcGIS Server or any Esri geoprocessing. It checks only the PROJ
   stack that pyproj, geopandas and GDAL builds use.
@@ -476,7 +493,20 @@ area-of-use refusal now rejects those points with exit 2.
   3.13.2, pyproj 3.8.0, PROJ 9.8.1, `pyproj.datadir.set_data_dir()` pointed at a copy of the PROJ
   data directory plus 20 `.tif` grids). An earlier version of the tool failed 13 on a Linux conda
   environment with 387 `.tif` files. The count follows the grids and the tool version. The check
-  itself is unaffected.
+  itself is unaffected. Each of those counts comes from one run and was not repeated.
+- A killed self-test, or one whose temporary directory cannot be removed, leaves a
+  `datumcheck-selftest-*` directory in the temporary directory. The tool ignores a failed removal.
+  Delete the directory by hand.
+- With `PROJ_NETWORK=ON` on a host that silently drops packets, the tool sets no timeout of its
+  own, so a run can stall until libcurl gives up. Only a refused connection was tested. Leave
+  `PROJ_NETWORK` off, or put a timeout on the job.
+- The self-test needs pyproj on the normal import path. Under `python -I` on a host where pyproj
+  sits in the user site-packages, it exits 2 with the install message. Run it without `-I`.
+- Three d25c27e self-test labels were replaced, not kept: "a version string reads as its first two
+  numbers", "a pyproj without get_last_used_operation exits 2 and names the version it needs" and
+  "the self-test refuses pyproj before 3.5 or PROJ before 9.2, and runs on anything newer". The
+  version gate is now the function `version_at_least`, and its new assertions cover the same
+  behaviour, including the pyproj 3.5 and PROJ 9.2 floor. Every other d25c27e assertion is kept verbatim.
 - The self-test's `PROJ_NETWORK=ON` assertions fail when an HTTP proxy variable such as
   `http_proxy` is set without a 127.0.0.1 `no_proxy` entry, because libcurl sends the loopback
   request to the proxy. Measured with `http_proxy=http://127.0.0.1:9`: 2 assertions failed.
@@ -491,9 +521,10 @@ area-of-use refusal now rejects those points with exit 2.
   1 with a Ballpark step. I could not fetch that grid offline, so I did not test the host that has it.
 - The default probe can print a coordinate with floating-point noise in the last digits, such as
   `-95.85000000000002`. The value is correct.
-- Any pair from NAD83(2011), WGS 84 or another zero-translation EPSG datum into the web-map CRS
+- A pair from NAD83(2011) or another zero-translation EPSG datum into the web-map CRS
   `EPSG:3857` exits 1 on any host, for the same reason as the bullet above. Measured for
-  `EPSG:6318` to `EPSG:3857` at -82 29.
+  `EPSG:6318` to `EPSG:3857` at -82 29. `EPSG:4326` to `EPSG:3857` is a projection with no datum
+  step, so it exits 0 (measured, same point).
 - A vertical-only CRS such as `EPSG:5703` exits 2, because the tool checks the horizontal move only.
   Give a horizontal or compound CRS.
 - Control and point files are echoed in errors. A header problem prints the first
