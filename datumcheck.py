@@ -31,6 +31,7 @@ directory when PROJ_NETWORK=ON.
 
 Exit codes: 0 no problem found, 1 a null-shift operation was used, 2 the check
 could not run, 3 a more accurate operation exists but its grids are missing,
+4 the control file missed by more than --max-miss (only with that flag),
 64 usage error, 70 a fault in this tool.
 """
 
@@ -90,11 +91,13 @@ UNMOVED_DEGREES = 1e-9
 OK = "OK"
 DEGRADED = "DEGRADED"
 NULL_SHIFT = "NULL SHIFT"
+CONTROL_MISS = "CONTROL MISS"
 
 EXIT_OK = 0
 EXIT_NULL = 1
 EXIT_ERROR = 2
 EXIT_DEGRADED = 3
+EXIT_MISS = 4
 EXIT_USAGE = 64
 EXIT_FAULT = 70
 
@@ -256,6 +259,21 @@ def judge(null, used_accuracy, unavailable):
     if better_missing(used_accuracy, unavailable):
         return DEGRADED
     return OK
+
+
+def usable_max_miss(feet):
+    """True for a finite miss limit of zero or more."""
+    return 0 <= feet < math.inf
+
+
+def control_gate(code, summary, max_miss_ft):
+    """Exit code once the optional control limit is applied. A worse code
+    stays; a clean run becomes EXIT_MISS when the worst miss is over the
+    limit. With no limit the control result never changes the code."""
+    if (code == EXIT_OK and max_miss_ft is not None
+            and summary["worst_ft"] > max_miss_ft):
+        return EXIT_MISS
+    return code
 
 
 def exit_code(verdicts):
@@ -493,7 +511,8 @@ def probe_lines(group):
     better = better_missing(group["accuracy"], group["missing"])
     if group.get("optional") and group["verdict"] == NULL_SHIFT:
         lines.append("  the CRS names the optional grid(s) %s and the point "
-                     "did not move; PROJ skips a missing optional grid "
+                     "did not move through the step that holds them; "
+                     "PROJ skips a missing optional grid "
                      "without a warning" % ascii_text(
                          ", ".join(group["optional"])))
     if not better:
@@ -584,6 +603,23 @@ def _unavailable(pyproj, src, dst, lon, lat):
             for op in group.unavailable_operations]
 
 
+def used_operation(pyproj, tf):
+    """The operation a transformer used last, or the transformer itself when
+    it holds one operation only and PROJ keeps no list of alternatives."""
+    try:
+        return tf.get_last_used_operation()
+    except pyproj.exceptions.ProjError:
+        return tf
+
+
+def skipped_optional(pyproj, to_hub, x, y):
+    """True when this side of the pair holds an optional grid and its own step
+    to the WGS 84 hub left the point where it was."""
+    hx, hy = to_hub.transform(x, y)
+    steps = _op_facts(used_operation(pyproj, to_hub))[0]
+    return bool(optional_grids(steps)) and unmoved(x, y, hx, hy)
+
+
 def probe_one(pyproj, ctx, x, y):
     """Transform one point and judge the operation PROJ used for it."""
     gx, gy = ctx["tf"].transform(x, y)
@@ -609,12 +645,7 @@ def probe_one(pyproj, ctx, x, y):
                 "another place applies, so the verdict would describe the "
                 "probe, not your data. Give X first (easting, or longitude "
                 "for a geographic CRS)." % ((x, y, role) + tuple(bounds)))
-    try:
-        op = ctx["tf"].get_last_used_operation()
-    except pyproj.exceptions.ProjError:
-        # One operation only: PROJ keeps no list of alternatives to report.
-        op = ctx["tf"]
-    steps, accuracy, desc = _op_facts(op)
+    steps, accuracy, desc = _op_facts(used_operation(pyproj, ctx["tf"]))
     # Looked up for every probe: the better operations depend on the position,
     # and one operation name can cover regions with different grids.
     missing = _unavailable(pyproj, ctx["src"], ctx["dst"], wrap_lon(lon), lat)
@@ -626,7 +657,10 @@ def probe_one(pyproj, ctx, x, y):
                 "the operation holds the optional grid(s) %s and datumcheck "
                 "can tell whether such a grid was used only between two "
                 "geographic CRS. Use EPSG codes." % ", ".join(optional))
-        null = null or unmoved(x, y, gx, gy)
+        # Each side alone: a later step that does move the point must not
+        # hide a skipped grid in an earlier one.
+        null = (null or skipped_optional(pyproj, ctx["to_lonlat"], x, y)
+                or skipped_optional(pyproj, ctx["dst_lonlat"], gx, gy))
     return {"x": x, "y": y, "desc": desc, "accuracy": accuracy,
             "missing": missing, "optional": optional,
             "ballpark": uses_ballpark(steps),
@@ -772,11 +806,13 @@ def run_check(args, out):
                         number, tx, ty))
             # Every control row was probed above, so its result is finite.
             misses.append(offset_ft(dst, (tx, ty), tf.transform(sx, sy)))
-        report.append(control_line(
-            summarize_misses(misses, args.parcel_acres)))
+        summary = summarize_misses(misses, args.parcel_acres)
+        report.append(control_line(summary))
+        code = control_gate(code, summary, args.max_miss)
     report.append("RESULT: %s (exit %d)" % (
         {EXIT_OK: "no null shift found",
-         EXIT_NULL: NULL_SHIFT, EXIT_DEGRADED: DEGRADED}[code], code))
+         EXIT_NULL: NULL_SHIFT, EXIT_DEGRADED: DEGRADED,
+         EXIT_MISS: CONTROL_MISS}[code], code))
     out.write("\n".join(report) + "\n")
     return code
 
@@ -810,6 +846,11 @@ def _parse(argv):
                     default=DEFAULT_PARCEL_ACRES, metavar="ACRES",
                     help="parcel size for the displaced-acres figure "
                          "(default %g)" % DEFAULT_PARCEL_ACRES)
+    ap.add_argument("--max-miss", dest="max_miss", type=float,
+                    default=None, metavar="FEET",
+                    help="with --control, exit 4 when the worst miss is "
+                         "more than this many US survey feet and nothing "
+                         "worse was found. Default: report, never gate")
     ap.add_argument("--self-test", dest="self_test", action="store_true",
                     help="run the assertions and exit")
     return ap.parse_args(argv)
@@ -848,6 +889,11 @@ def _run(argv):
     if not usable_parcel_acres(args.parcel_acres):
         print("error: --parcel-acres must be a positive number.",
               file=sys.stderr)
+        return EXIT_USAGE
+    if args.max_miss is not None and (
+            args.control is None or not usable_max_miss(args.max_miss)):
+        print("error: --max-miss needs --control and a number of feet that "
+              "is zero or more.", file=sys.stderr)
         return EXIT_USAGE
     try:
         return run_check(args, sys.stdout)
@@ -1075,6 +1121,18 @@ def _self_test(tmp, user_dir):
           and judge(False, 0.05, unavailable) == OK
           and judge(False, 1.0, []) == OK,
           "the verdict is null shift, degraded or ok in that order")
+    gate = {"worst_ft": 50.0}
+    check(control_gate(EXIT_OK, gate, None) == EXIT_OK
+          and control_gate(EXIT_OK, gate, 50.0) == EXIT_OK
+          and control_gate(EXIT_OK, gate, 49.9) == EXIT_MISS
+          and control_gate(EXIT_NULL, gate, 1.0) == EXIT_NULL
+          and control_gate(EXIT_DEGRADED, gate, 1.0) == EXIT_DEGRADED,
+          "a control limit turns only a clean run into exit 4  "
+          "<-- pinned defect")
+    check(usable_max_miss(0.0) and usable_max_miss(5.5)
+          and not usable_max_miss(-0.1) and not usable_max_miss(math.inf)
+          and not usable_max_miss(float("nan")),
+          "a control limit is a finite number of zero or more")
     check(exit_code([OK, DEGRADED, NULL_SHIFT]) == 1
           and exit_code([OK, DEGRADED]) == 3 and exit_code([OK]) == 0,
           "one null shift among the probes decides the exit code")
@@ -1550,6 +1608,20 @@ def _self_test(tmp, user_dir):
           and "a grid cannot fix" not in out,
           "a proj4 NAD27 definition whose optional grids are missing does not "
           "move the point and exits 1  <-- pinned defect")
+    # a later step that moves the point must not hide the skipped grid
+    classic = ("+proj=longlat +ellps=clrk66 +nadgrids=@conus,@alaska,"
+               "@ntv2_0.gsb,@ntv1_can.dat +no_defs")
+    code, out, err = run_cli(["--from", classic, "--to", "EPSG:4152",
+                              "--point", "-82", "29"])
+    check(code == 1 and "optional grid(s) @conus" in out
+          and "RESULT: NULL SHIFT (exit 1)" in out,
+          "a skipped optional grid is found when the target step moves the "
+          "point, source side  <-- pinned defect")
+    code, out, err = run_cli(["--from", "EPSG:4152", "--to", classic,
+                              "--point", "-82", "29"])
+    check(code == 1 and "optional grid(s) @conus" in out,
+          "a skipped optional grid is found when the source step moves the "
+          "point, target side  <-- pinned defect")
     code, out, err = run_cli(["--from", "+proj=longlat +datum=NAD27 "
                               "+nadgrids=null +no_defs", "--to", "EPSG:4269",
                               "--point", "-82", "29"])
@@ -1605,6 +1677,37 @@ def _self_test(tmp, user_dir):
           "the same 50 ft miss displaces 0.6432 acres of a four acre parcel")
     check("first at 500000.0, 1500000.0" in out and "2 probe(s)" in out,
           "the control rows are the probe points when no --point is given")
+
+    # a control limit turns a measured miss into an exit code, only on request
+    same = ["--from", "EPSG:2236", "--to", "EPSG:2236"]
+    ctl50 = write("ctl50.csv", "sx,sy,tx,ty\n600000,1200000,600050,1200000\n"
+                  "610000,1210000,610000,1210040\n")
+    code, out, err = run_cli(same + ["--control", ctl50])
+    check(code == 0 and "worst miss 50.00 ftUS" in out
+          and "RESULT: no null shift found (exit 0)" in out,
+          "a control miss of 50 ft without --max-miss is reported and exits "
+          "0, as documented")
+    code, out, err = run_cli(same + ["--control", ctl50, "--max-miss", "10"])
+    check(code == 4 and "worst miss 50.00 ftUS" in out
+          and "RESULT: CONTROL MISS (exit 4)" in out,
+          "a control miss of 50 ft over --max-miss 10 exits 4, not 0  "
+          "<-- pinned defect")
+    check(run_cli(same + ["--control", ctl50, "--max-miss", "50.1"])[0] == 0
+          and run_cli(same + ["--control", ctl50, "--max-miss", "49.9"])[0] == 4
+          and run_cli(same + ["--control", ctl50, "--max-miss", "0"])[0] == 4,
+          "a worst miss under --max-miss passes, one over it exits 4, and a "
+          "limit of zero fails any miss")
+    code, out, err = run_cli(base + ["--control", control, "--max-miss", "1"])
+    check(code == 3 and "RESULT: DEGRADED (exit 3)" in out,
+          "a missing grid keeps exit 3 when the control also misses by more "
+          "than --max-miss")
+    check(run_cli(same + ["--max-miss", "5"])[0] == 64
+          and run_cli(same + ["--control", ctl50, "--max-miss", "-1"])[0] == 64
+          and run_cli(same + ["--control", ctl50, "--max-miss", "nan"])[0] == 64
+          and run_cli(same + ["--control", ctl50, "--max-miss", "inf"])[0] == 64
+          and run_cli(same + ["--control", ctl50, "--max-mis", "5"])[0] == 64,
+          "--max-miss without --control, or negative, nan, infinite or "
+          "abbreviated, is a usage error")
 
     # a geographic target measures with a geodesic, not with degrees
     gx, gy = pyproj.Transformer.from_crs(

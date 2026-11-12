@@ -47,8 +47,11 @@ PASS  a default probe that falls offshore on a ballpark offset exits 2 and asks 
 PASS  Oahu alone is degraded, Nihoa alone is clean, and the pair exits 3 in either order  <-- pinned defect
 ...
 PASS  a proj4 NAD27 definition whose optional grids are missing does not move the point and exits 1  <-- pinned defect
+PASS  a skipped optional grid is found when the target step moves the point, source side  <-- pinned defect
 ...
 PASS  a control file 30 ft east and 40 ft north reports a 50.00 ftUS miss and 0.3078 acres
+...
+PASS  a control miss of 50 ft over --max-miss 10 exits 4, not 0  <-- pinned defect
 ...
 PASS  a probe outside the area of use of the source CRS exits 2  <-- pinned defect
 ...
@@ -59,7 +62,7 @@ PASS  the default probe of NAD83 to NAD83(2011) lies in the CONUS NADCON5 area, 
 PASS  a host without the grids refuses to emit control values and writes nothing  <-- pinned defect
 ...
 --------------------------------------------------------------------
-186 assertions, 0 failed
+195 assertions, 0 failed
 ```
 
 ## What already exists
@@ -74,6 +77,12 @@ PROJ and pyproj can already tell you most of this. They do the hard part, which 
   `PROJ_ONLY_BEST_DEFAULT` environment variable and the `only_best_default` setting of `proj.ini`,
   which turn the same refusal on for every transformation.
 - `allow_ballpark=False` refuses a ballpark offset.
+- `pyproj.aoi.BBox` has `contains` and `intersects` for area-of-use tests
+  (<https://pyproj4.github.io/pyproj/stable/api/aoi.html>). datumcheck uses its own box tests,
+  because they must handle a west-greater-than-east box and longitudes written east of 180.
+  Measured on pyproj 3.8.0: `BBox(167.65, 14.92, -40.73, 86.45)`, the `EPSG:4269` box, reports
+  `contains` and `intersects` as `False` for a small box in Florida, and
+  `BBox(-82.33, 24.41, -79.97, 30.83).contains(BBox(278, 25, 279, 26))` is `False`.
 - `projsync` and `pyproj sync` download the grids. `PROJ_NETWORK=ON` lets PROJ read them from the
   PROJ CDN as it needs them.
 - `OSGeo/PROJ-data` on GitHub holds the grids themselves.
@@ -96,8 +105,9 @@ What they do not do, as far as I could test:
   datumcheck reads the operation from `Transformer.get_last_used_operation()`, after it has
   transformed a real point.
 - `only_best=True` is a one-keyword gate on one stack I tested, and does nothing on two others.
-  With pyproj 3.8.0 and PROJ 9.8.1 and no grids, a plain call returned `(inf, inf)` and
-  `transform(..., errcheck=True)` raised `ProjError` ("No operation matching criteria found"). The
+  With pyproj 3.8.0 and PROJ 9.8.1 and no grids, a plain call returned the fallback coordinate.
+  With `only_best=True`, the same call returned `(inf, inf)` and `transform(..., errcheck=True)`
+  raised `ProjError` ("No operation matching criteria found"). The
   same happened with `PROJ_ONLY_BEST_DEFAULT=ON` set before the import, and for the NAD27 fallback
   (`EPSG:26760` to `EPSG:2238`, declared accuracy 14 m). With pyproj 3.7.2 and PROJ 9.5.1, and with
   pyproj 3.6.1 and PROJ 9.3.0, the same calls returned the fallback coordinate and raised nothing.
@@ -139,11 +149,11 @@ Tested on:
 
 | Host | Python | pyproj | PROJ | Self-test |
 |---|---|---|---|---|
-| Windows 11 | 3.13.2 (venv) | 3.8.0 | 9.8.1 | 186 assertions, 0 failed |
-| Windows 11 | 3.13.2 (`C:\Python313`) | 3.7.2 | 9.5.1 | 186 assertions, 0 failed |
-| Linux (Ubuntu) | 3.12.3 (venv) | 3.8.0 | 9.8.1 | 186 assertions, 0 failed |
-| Linux (Ubuntu) | 3.9.25 (venv) | 3.6.1 | 9.3.0 | 186 assertions, 0 failed |
-| Linux (Ubuntu) | 3.9.25 (venv) | 3.5.0 | 9.2.0 | 186 assertions, 0 failed |
+| Windows 11 | 3.13.2 (venv) | 3.8.0 | 9.8.1 | 195 assertions, 0 failed |
+| Windows 11 | 3.13.2 (`C:\Python313`) | 3.7.2 | 9.5.1 | 195 assertions, 0 failed |
+| Linux (Ubuntu) | 3.12.3 (venv) | 3.8.0 | 9.8.1 | 195 assertions, 0 failed |
+| Linux (Ubuntu) | 3.9.25 (venv) | 3.6.1 | 9.3.0 | 195 assertions, 0 failed |
+| Linux (Ubuntu) | 3.9.25 (venv) | 3.5.0 | 9.2.0 | 195 assertions, 0 failed |
 | Linux (Ubuntu) | 3.9.25 (venv) | 3.4.0 | 9.1.0 | refused, exit 2; the check refuses too |
 
 The count is the same on every host that runs the self-test, because the real PROJ part runs on
@@ -178,6 +188,7 @@ python datumcheck.py --from EPSG:2236 --to EPSG:6438 --emit-control points.csv >
 | `--point X Y` | centre of both areas of use, moved inside the area of the most accurate operation PROJ lists | A probe point in source CRS units. X first: easting, or longitude for a geographic CRS. Two numbers with a space between. Repeat the flag for more points. A point outside the area of use of the source CRS exits 2. Pass it for any real check: the default can lie offshore (see Limits). |
 | `--control CSV` | none | Known-good coordinates. Columns `sx,sy,tx,ty`. Adds the miss in feet and acres. The `sx,sy` values are the probes when you pass no `--point`. For a geographic target the `tx,ty` values must be degrees. |
 | `--emit-control CSV` | none | Read points (columns `sx,sy`) and print control rows to standard output. Refuses unless this host used the best available operation (exit 0). |
+| `--max-miss FEET` | none | With `--control`, exit 4 when the worst miss is more than this many US survey feet and nothing worse was found. Without it the control result never changes the exit code. A negative, `nan` or infinite value, or a use without `--control`, exits 64. |
 | `--parcel-acres N` | `1.0` | Parcel size for the acres figure. |
 | `--self-test` | off | Run the assertions and exit. |
 
@@ -191,10 +202,11 @@ are all refused with exit 64.
 
 | Code | Meaning |
 |---|---|
-| 0 | PROJ used a real operation at every probe. It never means the control file agrees: read the `control:` line. |
+| 0 | PROJ used a real operation at every probe. It means the control file agrees only when you passed `--max-miss`; otherwise read the `control:` line. |
 | 1 | PROJ used a null-shift operation at one probe or more, or skipped a missing optional grid (below). `--self-test` also exits 1 when an assertion fails. |
 | 2 | The check could not run: pyproj missing or older than 3.5, PROJ older than 9.2, unknown CRS, unreadable or bad CSV (an empty path counts as unreadable), a point PROJ cannot transform, a point outside the area of use of the source CRS, control values for a geographic target that are not degrees, or a default probe that fell on a ballpark offset (pass `--point`). |
 | 3 | The operation is not a null shift, but a more accurate one needs grids this host lacks. |
+| 4 | The operation is sound, but with `--control --max-miss` the worst control miss is over the limit. The `RESULT:` line says `CONTROL MISS`. A null shift (1), a missing grid (3) or a failed run (2) keeps its own code. |
 | 64 | Usage error, including an abbreviated or unknown flag. |
 | 70 | A fault in the tool. It is never a finding about your data. |
 
@@ -238,8 +250,12 @@ A proj4 string can name its grids, as in `+nadgrids=@conus,@alaska`. PROJ treats
 leading `@` as optional and does not complain when it is missing
 (<https://proj.org/en/stable/operations/transformations/hgridshift.html>). It applies no shift. The
 step holds a file name, not a zero, so the zero test above cannot see it. When the operation holds
-an optional grid, datumcheck checks whether the point moved. A point that moved less than
-0.000000001 degrees is a null shift and exits 1. This check works between two geographic CRS only.
+an optional grid, datumcheck checks each side alone: it transforms the point from the source CRS
+to WGS 84, and from the target CRS to WGS 84, and tests every side that holds an optional grid. A
+later step that does move the point cannot hide a skipped grid in an earlier one. Without this, a
+NAD27 definition with `+nadgrids=@conus,...` going to `EPSG:4152` printed `OK` and exited 0, because
+the target side moved the point. A side that moved less than 0.000000001 degrees is a null shift and
+exits 1. This check works between two geographic CRS only.
 With a projected CRS on either side the run exits 2, because it cannot tell. Use EPSG codes.
 
 A compound CRS, such as `EPSG:6438+5703`, is reduced to its horizontal part before the check. A
@@ -257,7 +273,7 @@ where your data lives can therefore get a different operation than your data get
 describes the probe, not the data.
 
 Each CRS carries an area of use: a box of west, south, east and north in degrees
-(`CRS.area_of_use` in pyproj, which is `None` when the CRS has none). `EPSG:2236` reports west
+(`CRS.area_of_use` in pyproj, typed `AreaOfUse` or `None`). `EPSG:2236` reports west
 -82.33, south 24.41, east -79.97, north 30.83. `EPSG:4269` reports west 167.65, south 14.92, east
 -40.73, north 86.45: west is greater than east, so the box crosses the antimeridian. datumcheck
 turns each probe into longitude and latitude and exits 2 when it lies outside the box of the
@@ -381,11 +397,12 @@ area-of-use refusal now rejects those points with exit 2.
 - Horizontal only. A vertical datum is not checked. A compound CRS is reduced to its horizontal
   part.
 - Exit 0 means only that PROJ used no null-shift operation and knows of no better one that is
-  missing. It never means that the control file agrees. With a control file the miss is reported
-  but never gated: a control row 50 ft off still prints `worst miss 50.00 ftUS` and exits 0 on a
-  host with the grids. This holds for a bad control file too, such as swapped columns or values
-  in the wrong units. The closing `RESULT:` line does not mention the control result, so read the
-  `control:` line too.
+  missing. It means that the control file agrees only when you passed `--max-miss`. With a control
+  file and no `--max-miss` the miss is reported but never gated: a control row 50 ft off still
+  prints `worst miss 50.00 ftUS` and exits 0 on a host with the grids. This holds for a bad
+  control file too, such as swapped columns or values in the wrong units. Pass `--max-miss FEET` to
+  turn a miss over the limit into exit 4 (`RESULT: CONTROL MISS`); the self-test pins this on a 50
+  ft miss. The limit gates the worst row only, and a wrong limit passes a bad file.
 - The error in feet and acres appears only when you pass `--control` (or an emitted control file).
   Without ground truth the report shows only PROJ's declared accuracy in metres.
 - A NAD83(2011) to WGS 84 move (`EPSG:6318` to `EPSG:4326`) and an ETRS89 to WGS 84 move
@@ -478,7 +495,29 @@ area-of-use refusal now rejects those points with exit 2.
   prints the names with their spaces. Remove the spaces. The tool does not trim header names.
 - The reading of `area_of_use` with west greater than east as a box that crosses the antimeridian is
   my interpretation of the EPSG and PROJ box convention. The self-test checks it. The pyproj
-  documentation states only that `area_of_use` is `None` when a CRS has none.
+  documentation lists `area_of_use` as `AreaOfUse` or `None` and gives the four bounds as plain
+  floats; it does not say what west greater than east means.
+- Three d25c27e self-test assertions were replaced when the version gate became `version_at_least`;
+  every other one is kept verbatim.
+- The verdict for a classic proj4 string that names optional grids, such as
+  `+nadgrids=@conus,@alaska,@ntv2_0.gsb,@ntv1_can.dat`, depends on which legacy grid files the host
+  holds. Measured with `--to EPSG:4269` at -82 29: the Windows venv, which holds the legacy `conus`
+  grid, exits 0, and the Linux host with no grids exits 1. Each is correct for its host.
+- `--emit-control` writes only fixed-format numbers (`%.6f`, header `sx,sy,tx,ty`), so no cell can
+  start with `=`, `+`, `@`, a tab or a carriage return. A negative number starts with a minus sign
+  and a spreadsheet reads it as a number.
+- A fault (exit 70) prints a Python traceback that includes the local script path and user
+  directory names. Keep CI logs of an exit 70 private.
+- With standard output closed (`>&-`), the run exits 70 with an `AttributeError` traceback, not 120.
+  Only a pipe whose reader has exited gives 120.
+- The self-test passes its whole environment, proxy variables with a user name and password
+  included, to the child process it starts for the `PROJ_NETWORK=ON` check. It prints none of it.
+  Run it with a clean environment on a shared host.
+- Setting `PROJ_DATA` does not hide grids kept in the PROJ user directory (the Windows venv found
+  its grids there). To test a host without grids, set `PROJ_USER_WRITABLE_DIRECTORY` to an empty
+  directory, as the self-test does.
+- The working-tree copies of `LICENSE` and `.gitignore` are CRLF on a Windows checkout with
+  `core.autocrlf=true`, while the repository holds LF. This does not change the published files.
 - Interrupting the run with Ctrl+C exits with the interpreter's own code, not one of the codes above.
 - A fault inside the check that raises `ValueError`, `RuntimeError` or `OSError` is reported as exit
   2, so it cannot be told apart from bad input.
@@ -540,7 +579,7 @@ area-of-use refusal now rejects those points with exit 2.
   line of the file, and a bad cell prints the cell. Do not point `--control` or `--emit-control` at
   a file that holds secrets, and keep CI logs of an exit 2 private.
 - The report header prints the `--from` and `--to` text as given. Pass CRS text that holds no
-  credentials, such as a URL with a user name and password.
+  credentials, such as a URL that contains a user name and password.
 - A closed stdout pipe, such as piping the report to `head`, can replace a finding code of 1 or 3
   with another code. Measured on the Windows venv with the pipe closed before the run: exit 120.
   Do not truncate the output of a gating run.
@@ -548,11 +587,11 @@ area-of-use refusal now rejects those points with exit 2.
   missing operation. A pair could exit 0 on a known-accuracy fallback while such a grid is
   missing. I searched 310 geographic CRS pairs with `TransformerGroup` and found no real case.
 - The system `python3` on the Linux host has no pyproj, so `python3 datumcheck.py --self-test` there
-  exits 2 and prints no PASS lines. The 186 assertion result needs a virtual environment with pyproj.
+  exits 2 and prints no PASS lines. The 195 assertion result needs a virtual environment with pyproj.
 - Branch coverage is 100 percent on both hosts, from `coverage run --branch datumcheck.py
-  --self-test`: 910 statements and 174 branches on the Windows venv (coverage 7.16.1) and the same
-  910 and 174 on Linux (coverage 7.17.2), with none missed or partly covered. No line is excluded.
-  The network lines run against the loopback stub. All hosts run the same 186 assertions, because
+  --self-test`: 947 statements and 178 branches on the Windows venv (coverage 7.16.1) and the same
+  947 and 178 on Linux (coverage 7.17.2), with none missed or partly covered. No line is excluded.
+  The network lines run against the loopback stub. All hosts run the same 195 assertions, because
   the real PROJ part runs on every host with the grids hidden.
 
 ## Sources checked
@@ -569,8 +608,9 @@ area-of-use refusal now rejects those points with exit 2.
 - Search order of grid directories, the Windows and Linux user-writable directory:
   <https://proj.org/en/stable/resource_files.html>
 - `PROJ_NETWORK`: <https://proj.org/en/stable/usage/environmentvars.html>
-- `CRS.area_of_use`, which is `None` when a CRS has none:
-  <https://pyproj4.github.io/pyproj/stable/api/crs/crs.html>
+- `CRS.area_of_use`, typed `AreaOfUse | None`:
+  <https://pyproj4.github.io/pyproj/stable/api/crs/crs.html>, and `pyproj.aoi.AreaOfUse`, whose
+  fields are `west`, `south`, `east` and `north`: <https://pyproj4.github.io/pyproj/stable/api/aoi.html>
 - `proj_get_area_of_use`, the box in degrees and the unknown value -1000:
   <https://proj.org/en/stable/development/reference/functions.html>
 - `proj_trans()` compares the coordinate with the area of use of operations, and the ballpark
