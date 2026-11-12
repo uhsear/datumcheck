@@ -417,13 +417,15 @@ def in_area(lon, lat, bounds):
 
 def is_global(bounds):
     """True when a (west, south, east, north) box covers the whole globe."""
-    return bounds is not None and bounds[0] <= -180.0 and bounds[1] <= -90.0         and bounds[2] >= 180.0 and bounds[3] >= 90.0
+    return (bounds is not None and bounds[0] <= -180.0
+            and bounds[1] <= -90.0 and bounds[2] >= 180.0
+            and bounds[3] >= 90.0)
 
 
 def wrap_lon(lon):
-    """A longitude in degrees as a number in (-180, 180]. PROJ 9.2 and 9.3 on
-    Windows died with a stack overflow when asked for the operations in a box
-    that starts east of 180, as the box around the probe 200 E does."""
+    """A longitude in degrees as a number in (-180, 180]. The PROJ reference
+    for proj_area_set_bbox takes the longitudes of an area in the [-180,180]
+    range, so the box around the probe 200 E is built from 160 W."""
     return 180.0 - ((180.0 - lon) % 360.0)
 
 
@@ -570,6 +572,19 @@ def _import_pyproj():
     return pyproj
 
 
+def area_bounds(pyproj, crs):
+    """The (west, south, east, north) area of use of a CRS, or None. A CRS
+    read from an ESRI .prj or a proj4 string carries no area of use, so the
+    EPSG CRS that PROJ identifies it as (confidence 70 or more) lends its
+    area."""
+    area = crs.area_of_use
+    if area is None:
+        code = crs.to_epsg()
+        area = None if code is None else             pyproj.CRS.from_epsg(code).area_of_use
+    return None if area is None else (
+        area.west, area.south, area.east, area.north)
+
+
 def horizontal(crs):
     """The horizontal part of a compound CRS, else the CRS itself.
 
@@ -628,11 +643,12 @@ def probe_one(pyproj, ctx, x, y):
                          "is outside what the source CRS supports, or a grid "
                          "it needs could not be read." % (x, y))
     lon, lat = ctx["to_lonlat"].transform(x, y)
-    # A world-wide source (EPSG:4326) cannot refuse a latitude-first point, so
-    # the target area stands in. Otherwise only the source is checked: data
-    # in one zone may be moved into a zone that does not cover it.
+    # A world-wide source (EPSG:4326) or a source with no known area cannot
+    # refuse a latitude-first point, so the target area stands in. Otherwise
+    # only the source is checked: data in one zone may be moved into a zone
+    # that does not cover it.
     checks = [("source", ctx["bounds"], (lon, lat))]
-    if is_global(ctx["bounds"]):
+    if ctx["bounds"] is None or is_global(ctx["bounds"]):
         checks = [("target", ctx["dst_bounds"],
                    ctx["dst_lonlat"].transform(gx, gy))]
     for role, bounds, where in checks:
@@ -663,6 +679,9 @@ def probe_one(pyproj, ctx, x, y):
                 or skipped_optional(pyproj, ctx["dst_lonlat"], gx, gy))
     return {"x": x, "y": y, "desc": desc, "accuracy": accuracy,
             "missing": missing, "optional": optional,
+            "unchecked": None in (ctx["bounds"], ctx["dst_bounds"])
+            and not any(b is not None and not is_global(b)
+                        for b in (ctx["bounds"], ctx["dst_bounds"])),
             "ballpark": uses_ballpark(steps),
             "verdict": judge(null, accuracy, missing)}
 
@@ -720,6 +739,12 @@ DEFAULT_PROBE_NOTE = (
     "--point with a place in your data.")
 
 
+UNCHECKED_NOTE = (
+    "note: only a world-wide area of use, or none, is known for the two "
+    "CRS, so the position of a probe was not checked. A northing-first or longitude/latitude point gets a "
+    "verdict about the wrong place. Use EPSG codes to have it checked.")
+
+
 def refuse_defaulted_ballpark(res):
     """Raise ValueError when the default probe cannot support its verdict.
 
@@ -748,13 +773,9 @@ def run_check(args, out):
         raise ValueError("cannot read a CRS: %s" % exc)
     src, dst = horizontal(src), horizontal(dst)
     tf = pyproj.Transformer.from_crs(src, dst, always_xy=True)
-    area = src.area_of_use
     ctx = {"src": src, "dst": dst, "tf": tf,
-           "bounds": None if area is None else
-           (area.west, area.south, area.east, area.north),
-           "dst_bounds": None if dst.area_of_use is None else
-           (dst.area_of_use.west, dst.area_of_use.south,
-            dst.area_of_use.east, dst.area_of_use.north),
+           "bounds": area_bounds(pyproj, src),
+           "dst_bounds": area_bounds(pyproj, dst),
            "to_lonlat": pyproj.Transformer.from_crs(
                src, "EPSG:4326", always_xy=True),
            "dst_lonlat": pyproj.Transformer.from_crs(
@@ -779,6 +800,9 @@ def run_check(args, out):
     report = [report_header(args.src, args.dst)]
     if defaulted:
         report.append(DEFAULT_PROBE_NOTE)
+    unchecked = any(r["unchecked"] for r in results)
+    if unchecked:
+        report.append(UNCHECKED_NOTE)
     for group in group_probes(results):
         report.extend(probe_lines(group))
 
@@ -789,6 +813,8 @@ def run_check(args, out):
                           "missing on this host")
             print("\n".join(report), file=sys.stderr)
             return code
+        if unchecked:
+            print(UNCHECKED_NOTE, file=sys.stderr)
         out.write("sx,sy,tx,ty\n")
         for sx, sy in emit:
             tx, ty = tf.transform(sx, sy)
@@ -810,7 +836,8 @@ def run_check(args, out):
         report.append(control_line(summary))
         code = control_gate(code, summary, args.max_miss)
     report.append("RESULT: %s (exit %d)" % (
-        {EXIT_OK: "no null shift found",
+        {EXIT_OK: "no null shift found" if not unchecked else
+         "no null shift found at a probe whose position was not checked",
          EXIT_NULL: NULL_SHIFT, EXIT_DEGRADED: DEGRADED,
          EXIT_MISS: CONTROL_MISS}[code], code))
     out.write("\n".join(report) + "\n")
@@ -1773,6 +1800,53 @@ def _self_test(tmp, user_dir):
     check(code in (1, 3) and "outside the area of use" not in err,
           "a longitude written east of 180 that wraps into the area of use "
           "is probed, not refused  <-- pinned defect")
+
+    # an ESRI .prj (WKT1_ESRI) or a proj4 string has no area of use of its
+    # own; PROJ identifies it as an EPSG CRS, and that CRS lends the area
+    prj = pyproj.CRS.from_epsg(26717).to_wkt(version="WKT1_ESRI")
+    check(pyproj.CRS.from_wkt(prj).area_of_use is None
+          and area_bounds(pyproj, pyproj.CRS.from_wkt(prj)) is not None,
+          "an ESRI .prj has no area of use of its own and borrows the one of "
+          "the EPSG CRS it matches  <-- pinned defect")
+    prj_pair = ["--from", prj, "--to", "EPSG:2883"]
+    good = run_cli(prj_pair + ["--point", "400000", "3200000"])
+    swapped = run_cli(prj_pair + ["--point", "3200000", "400000"])
+    lonlat = run_cli(prj_pair + ["--point", "-82", "29"])
+    check(good[0] in (1, 3) and "area of use" not in good[2]
+          and swapped[0] == 2 and "area of use of the source CRS" in swapped[2]
+          and lonlat[0] == 2 and "RESULT" not in swapped[1] + lonlat[1],
+          "an ESRI .prj source refuses a northing-first and a lon/lat point "
+          "like its EPSG twin, not a false exit 0  <-- pinned defect")
+    code, out, err = run_cli(["--from", "+proj=longlat +datum=NAD27 +no_defs",
+                              "--to", "EPSG:4269", "--point", "29.2", "-82"])
+    check(code == 2 and "area of use of the source CRS" in err,
+          "a latitude-first point on a proj4 string that PROJ identifies as "
+          "EPSG:4267 exits 2, not a Ballpark verdict  <-- pinned defect")
+    unknown = "+proj=longlat +ellps=GRS80 +towgs84=0,0,0 +no_defs"
+    code, out, err = run_cli(["--from", unknown, "--to", "EPSG:4269",
+                              "--point", "29.2", "-82"])
+    check(code == 2 and "area of use of the target CRS" in err,
+          "a source with no known area is checked against the target area  "
+          "<-- pinned defect")
+    shifted = "+proj=longlat +ellps=clrk66 +towgs84=-8,160,176 +no_defs"
+    code, out, err = run_cli(["--from", shifted, "--to", unknown,
+                              "--point", "-82", "29.2"])
+    check(code == 0 and "position of a probe was not checked" in out
+          and "RESULT: no null shift found at a probe whose position was not "
+          "checked (exit 0)" in out,
+          "two CRS with no area of use warn that the position was not "
+          "checked and do not claim a plain OK  <-- pinned defect")
+    code, out, err = run_cli(["--from", "EPSG:4326", "--to", "EPSG:4979",
+                              "--point", "-82.0", "29.2"])
+    check("not checked" not in out,
+          "two world-wide CRS carry no unchecked-position note")
+    pts = write("unchecked.csv", "sx,sy\n-82,29.2\n")
+    code, out, err = run_cli(["--from", shifted, "--to", unknown,
+                              "--emit-control", pts])
+    check(code == 0 and out.startswith("sx,sy,tx,ty\n")
+          and "position of a probe was not checked" in err,
+          "--emit-control for CRS with no area of use warns on stderr while "
+          "the CSV on stdout stays clean  <-- pinned defect")
 
     # the default probe lies where the most accurate operation applies, not
     # at sea (the old centre of the two areas, -128.1 44.8, is in the Pacific)
