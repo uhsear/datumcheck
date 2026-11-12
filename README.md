@@ -59,7 +59,7 @@ PASS  the default probe of NAD83 to NAD83(2011) lies in the CONUS NADCON5 area, 
 PASS  a host without the grids refuses to emit control values and writes nothing  <-- pinned defect
 ...
 --------------------------------------------------------------------
-183 assertions, 0 failed
+186 assertions, 0 failed
 ```
 
 ## What already exists
@@ -139,11 +139,11 @@ Tested on:
 
 | Host | Python | pyproj | PROJ | Self-test |
 |---|---|---|---|---|
-| Windows 11 | 3.13.2 (venv) | 3.8.0 | 9.8.1 | 183 assertions, 0 failed |
-| Windows 11 | 3.13.2 (`C:\Python313`) | 3.7.2 | 9.5.1 | 183 assertions, 0 failed |
-| Linux (Ubuntu) | 3.12.3 (venv) | 3.8.0 | 9.8.1 | 183 assertions, 0 failed |
-| Linux (Ubuntu) | 3.9.25 (venv) | 3.6.1 | 9.3.0 | 183 assertions, 0 failed |
-| Linux (Ubuntu) | 3.9.25 (venv) | 3.5.0 | 9.2.0 | 183 assertions, 0 failed |
+| Windows 11 | 3.13.2 (venv) | 3.8.0 | 9.8.1 | 186 assertions, 0 failed |
+| Windows 11 | 3.13.2 (`C:\Python313`) | 3.7.2 | 9.5.1 | 186 assertions, 0 failed |
+| Linux (Ubuntu) | 3.12.3 (venv) | 3.8.0 | 9.8.1 | 186 assertions, 0 failed |
+| Linux (Ubuntu) | 3.9.25 (venv) | 3.6.1 | 9.3.0 | 186 assertions, 0 failed |
+| Linux (Ubuntu) | 3.9.25 (venv) | 3.5.0 | 9.2.0 | 186 assertions, 0 failed |
 | Linux (Ubuntu) | 3.9.25 (venv) | 3.4.0 | 9.1.0 | refused, exit 2; the check refuses too |
 
 The count is the same on every host that runs the self-test, because the real PROJ part runs on
@@ -471,6 +471,15 @@ area-of-use refusal now rejects those points with exit 2.
 - A field larger than 128 KiB in a control or point file, or a NUL byte in a number, exits 2 with
   the line number. Measured with a 200,000 digit field: `line 1: field larger than field limit
   (131072)`.
+- For an oversized field or a NUL byte, the reported line number can be one too low: a field on
+  line 3 is reported as line 2. Measured with a header and two data rows. Count from the line named
+  in the message and look at the next one.
+- A control header with spaces after the commas, such as `sx, sy, tx, ty`, exits 2, and the message
+  prints the names with their spaces. Remove the spaces. The tool does not trim header names.
+- The reading of `area_of_use` with west greater than east as a box that crosses the antimeridian is
+  my interpretation of the EPSG and PROJ box convention. The self-test checks it. The pyproj
+  documentation states only that `area_of_use` is `None` when a CRS has none.
+- Interrupting the run with Ctrl+C exits with the interpreter's own code, not one of the codes above.
 - A fault inside the check that raises `ValueError`, `RuntimeError` or `OSError` is reported as exit
   2, so it cannot be told apart from bad input.
 - An absurd `--parcel-acres`, such as `1e300`, loses precision: the area minus the overlap cancels
@@ -539,11 +548,11 @@ area-of-use refusal now rejects those points with exit 2.
   missing operation. A pair could exit 0 on a known-accuracy fallback while such a grid is
   missing. I searched 310 geographic CRS pairs with `TransformerGroup` and found no real case.
 - The system `python3` on the Linux host has no pyproj, so `python3 datumcheck.py --self-test` there
-  exits 2 and prints no PASS lines. The 183 assertion result needs a virtual environment with pyproj.
+  exits 2 and prints no PASS lines. The 186 assertion result needs a virtual environment with pyproj.
 - Branch coverage is 100 percent on both hosts, from `coverage run --branch datumcheck.py
-  --self-test`: 902 statements and 172 branches on the Windows venv (coverage 7.16.1) and the same
-  902 and 172 on Linux (coverage 7.17.2), with none missed or partly covered. No line is excluded.
-  The network lines run against the loopback stub. All hosts run the same 183 assertions, because
+  --self-test`: 910 statements and 174 branches on the Windows venv (coverage 7.16.1) and the same
+  910 and 174 on Linux (coverage 7.17.2), with none missed or partly covered. No line is excluded.
+  The network lines run against the loopback stub. All hosts run the same 186 assertions, because
   the real PROJ part runs on every host with the grids hidden.
 
 ## Sources checked
