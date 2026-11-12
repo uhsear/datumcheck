@@ -45,6 +45,7 @@ import importlib.util
 import io
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -463,10 +464,23 @@ def collect_points(explicit, control, emit):
             + [(r[0], r[1]) for r in emit])
 
 
+_USERINFO = re.compile(r"(://)[^/\s?#]*@")
+_SECRET_PARAM = re.compile(
+    r"(?i)\b(password|passwd|pwd|token|access_token|secret|api_?key)=[^&\s]+")
+
+
+def redact(text):
+    """Hide URL user:password and secret-looking query values. CRS text from
+    --from and --to can be a URL, and the tool echoes it into logs."""
+    text = _USERINFO.sub(r"\1***@", str(text))
+    return _SECRET_PARAM.sub(r"\1=***", text)
+
+
 def report_header(src, dst):
     """The first report line. CRS text can hold any character; a console may
     not print it."""
-    return "datumcheck: %s -> %s" % (ascii_text(src), ascii_text(dst))
+    return "datumcheck: %s -> %s" % (
+        ascii_text(redact(src)), ascii_text(redact(dst)))
 
 
 def ascii_text(text):
@@ -890,9 +904,9 @@ def main(argv=None):
         return _run(argv)
     except Exception as exc:
         print("error: unexpected %s: %s. This is a fault in the tool, not a "
-              "finding about the data." % (type(exc).__name__, exc),
+              "finding about the data." % (type(exc).__name__, redact(exc)),
               file=sys.stderr)
-        traceback.print_exc()
+        sys.stderr.write(redact(traceback.format_exc()))
         return EXIT_FAULT
 
 
@@ -925,7 +939,7 @@ def _run(argv):
     try:
         return run_check(args, sys.stdout)
     except (RuntimeError, ValueError, OSError) as exc:
-        print("error: %s" % exc, file=sys.stderr)
+        print("error: %s" % redact(exc), file=sys.stderr)
         return EXIT_ERROR
 
 
@@ -1450,6 +1464,9 @@ def _self_test(tmp, user_dir):
     code, out, err = run_cli(["--from", "a", "--to", "b", "--apply"])
     check(code == 64 and "unrecognized arguments: --apply" in err,
           "there is no --apply, so none can be shortened to --ap")
+    code, out, err = run_cli(["--from", "a", "--to", "b", "--ap"])
+    check(code == 64 and "unrecognized arguments: --ap" in err,
+          "the literal write-flag prefix --ap is refused  <-- pinned defect")
     check(run_cli([])[0] == 64, "a run with no CRS is a usage error")
     check(run_cli(["--from", "EPSG:2237"])[0] == 64,
           "a run with one CRS is a usage error")
@@ -2004,6 +2021,24 @@ def _self_test(tmp, user_dir):
     code, out, err = run_cli(["--from", "EPSG:9999999", "--to", "EPSG:2883"])
     check(code == 2 and "cannot read a CRS" in err,
           "an unknown CRS exits 2")
+    code, out, err = run_cli(["--from", "https://user:SECRET1@host.invalid/x",
+                              "--to", "EPSG:4326", "--point", "-82", "29"])
+    check(code == 2 and "cannot read a CRS" in err and "SECRET1" not in err
+          and "SECRET1" not in out,
+          "a credential in --from URL text is not echoed in the CRS error  "
+          "<-- pinned defect")
+    code, out, err = run_cli(["--from", "EPSG:4326", "--to",
+                              "+proj=longlat +datum=WGS84 "
+                              "+title=https://u:SECRET2@h.invalid/x"
+                              "?token=SECRET3", "--point", "-82", "29"])
+    check(code == 0 and "SECRET2" not in out + err
+          and "SECRET3" not in out + err and "https://***@h.invalid" in out,
+          "a credential in a valid --to string is not echoed in the report header  "
+          "<-- pinned defect")
+    check(redact("ftp://u:p@ss@h/x?apikey=K1&b=2") == "ftp://***@h/x?apikey=***&b=2"
+          and redact("EPSG:4326") == "EPSG:4326",
+          "redact hides a user:password that holds an @ and leaves a plain "
+          "code alone")
     check(run_cli(base + ["--control", os.path.join(tmp, "absent.csv")])[0]
           == 2, "a control file that does not exist exits 2")
     bad = write("bad.csv", "sx,sy,tx,ty\n1,2,3\n")
@@ -2052,6 +2087,16 @@ def _self_test(tmp, user_dir):
         globals()["_run"] = real_run
     check(code == 70 and "fault in the tool" in err,
           "an unexpected exception exits 70, never 1  <-- pinned defect")
+    def boom_secret(argv):
+        raise KeyError("https://u:SECRET4@h.invalid/x")
+    globals()["_run"] = boom_secret
+    try:
+        code, out, err = run_cli(base)
+    finally:
+        globals()["_run"] = real_run
+    check(code == 70 and "SECRET4" not in err and "https://***@h.invalid" in err,
+          "an exit 70 message and traceback do not echo a credential  "
+          "<-- pinned defect")
 
     # ---- the module and the harness
     spec = importlib.util.spec_from_file_location(

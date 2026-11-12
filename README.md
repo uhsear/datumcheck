@@ -56,6 +56,7 @@ PASS  a control miss of 50 ft over --max-miss 10 exits 4, not 0  <-- pinned defe
 PASS  a probe outside the area of use of the source CRS exits 2  <-- pinned defect
 ...
 PASS  a latitude-first --point from EPSG:4326 to EPSG:4267 exits 2, not a false NULL SHIFT  <-- pinned defect
+PASS  a credential in --from URL text is not echoed in the CRS error  <-- pinned defect
 PASS  a longitude written east of 180 that wraps into the area of use is probed, not refused  <-- pinned defect
 ...
 PASS  an ESRI .prj source refuses a northing-first and a lon/lat point like its EPSG twin, not a false exit 0  <-- pinned defect
@@ -64,7 +65,7 @@ PASS  the default probe of NAD83 to NAD83(2011) lies in the CONUS NADCON5 area, 
 PASS  a host without the grids refuses to emit control values and writes nothing  <-- pinned defect
 ...
 --------------------------------------------------------------------
-202 assertions, 0 failed
+207 assertions, 0 failed
 ```
 
 ## What already exists
@@ -151,11 +152,11 @@ Tested on:
 
 | Host | Python | pyproj | PROJ | Self-test |
 |---|---|---|---|---|
-| Windows 11 | 3.13.2 (venv) | 3.8.0 | 9.8.1 | 202 assertions, 0 failed |
-| Windows 11 | 3.13.2 (`C:\Python313`) | 3.7.2 | 9.5.1 | 202 assertions, 0 failed |
-| Linux (Ubuntu) | 3.12.3 (venv) | 3.8.0 | 9.8.1 | 202 assertions, 0 failed |
-| Linux (Ubuntu) | 3.9.25 (venv) | 3.6.1 | 9.3.0 | 202 assertions, 0 failed |
-| Linux (Ubuntu) | 3.9.25 (venv) | 3.5.0 | 9.2.0 | 202 assertions, 0 failed |
+| Windows 11 | 3.13.2 (venv) | 3.8.0 | 9.8.1 | 207 assertions, 0 failed |
+| Windows 11 | 3.13.2 (`C:\Python313`) | 3.7.2 | 9.5.1 | 207 assertions, 0 failed |
+| Linux (Ubuntu) | 3.12.3 (venv) | 3.8.0 | 9.8.1 | 207 assertions, 0 failed |
+| Linux (Ubuntu) | 3.9.25 (venv) | 3.6.1 | 9.3.0 | 207 assertions, 0 failed |
+| Linux (Ubuntu) | 3.9.25 (venv) | 3.5.0 | 9.2.0 | 207 assertions, 0 failed |
 | Linux (Ubuntu) | 3.9.25 (venv) | 3.4.0 | 9.1.0 | refused, exit 2; the check refuses too |
 | Linux (Ubuntu) | 3.9.25 (venv) | 3.4.1 | 9.1.0 | refused, exit 2, the same as 3.4.0 |
 
@@ -601,10 +602,28 @@ area-of-use refusal now rejects those points with exit 2.
 - Control and point files are echoed in errors. A header problem prints the first
   line of the file, and a bad cell prints the cell. Do not point `--control` or `--emit-control` at
   a file that holds secrets, and keep CI logs of an exit 2 private.
-- The `--from` and `--to` text is printed as given in the report header, in the CRS error message
-  and in an exit 70 traceback. Never pass CRS text that holds credentials, such as a URL that
-  contains a user name and password: measured with `--from https://user:SECRET@host.invalid/x`,
-  the secret appears in the exit 2 message and so in CI logs.
+- The tool redacts the user name and password in a URL (`scheme://user:password@host`) and the value
+  of a `password`, `passwd`, `pwd`, `token`, `access_token`, `secret` or `apikey` query parameter
+  in the `--from` and `--to` text before it prints that text in the report header, in the CRS
+  error and in an exit 70 message and traceback. Measured with
+  `--from https://user:SECRET@host.invalid/x`: the exit 2 message shows `https://***@host.invalid/x`.
+  The tool does not know other secret formats, so never pass CRS text that holds credentials.
+  Control and point file cells are not redacted (see the bullet above).
+- A probe exactly on the edge of the area-of-use rectangle is accepted. Measured with
+  `--from EPSG:4267 --to EPSG:4269`: south 7.15 gives a verdict and 7.14 exits 2. The self-test
+  does not pin the boundary, and a mutant of `in_area` that uses `<` instead of `<=` would pass.
+- With no bounded area on either side, a latitude-first point is not refused and the verdict is
+  marked "position was not checked". Measured with two `+proj=longlat +ellps=GRS80 +no_defs`
+  strings at `--point 29.2 -82`: exit 0. A gate that must catch a latitude-first point should use
+  EPSG codes.
+- A rectangular area-of-use box can refuse a legitimate point just outside a CRS's published box,
+  such as at a UTM zone edge. The refusal is exit 2 (the tool could not tell), not a verdict.
+- A control row with more than four fields is accepted, and the extra fields are ignored without a
+  warning (measured, a six field row). A control file with wrong target values exits 0 unless you
+  pass `--max-miss`, so always pass it in a gating run.
+- The rule that only `--apply` may write holds vacuously, because the tool has no `--apply` flag. The self-test
+  writes a temporary directory, and PROJ writes `cache.db` to its user directory when
+  `PROJ_NETWORK=ON`. Both are described above.
 - A closed stdout pipe, such as piping the report to `head`, can replace a finding code of 1 or 3
   with another code. Measured on the Windows venv with the pipe closed before the run: exit 120.
   Do not truncate the output of a gating run. Treat any exit code other than 0, 1, 3 and 4 as a
@@ -613,11 +632,12 @@ area-of-use refusal now rejects those points with exit 2.
   missing operation. A pair could exit 0 on a known-accuracy fallback while such a grid is
   missing. I searched 310 geographic CRS pairs with `TransformerGroup` and found no real case.
 - The system `python3` on the Linux host has no pyproj, so `python3 datumcheck.py --self-test` there
-  exits 2 and prints no PASS lines. The 202 assertion result needs a virtual environment with pyproj.
+  exits 2 and prints no PASS lines. The 207 assertion result needs a virtual environment with pyproj.
 - Branch coverage is 100 percent on both hosts, from `coverage run --branch datumcheck.py
-  --self-test`: 978 statements and 184 branches on the Windows venv (coverage 7.16.1) and the same
-  978 and 184 on Linux (coverage 7.17.2), with none missed or partly covered. No line is excluded.
-  The network lines run against the loopback stub. All hosts run the same 202 assertions, because
+  --self-test`: 998 statements and 184 branches on the Windows venv (coverage 7.16.1) and the same
+  998 and 184 on Linux (coverage 7.17.0 in the `dcvenv` venv and 7.17.2 in a second venv),
+  with none missed or partly covered. No line is excluded.
+  The network lines run against the loopback stub. All hosts run the same 207 assertions, because
   the real PROJ part runs on every host with the grids hidden.
 
 ## Sources checked
