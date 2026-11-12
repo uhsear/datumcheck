@@ -464,7 +464,7 @@ def collect_points(explicit, control, emit):
             + [(r[0], r[1]) for r in emit])
 
 
-_USERINFO = re.compile(r"(://)[^/\s?#]*@")
+_USERINFO = re.compile(r"(://)[^/\s]*@")
 _SECRET_PARAM = re.compile(
     r"(?i)\b(password|passwd|pwd|token|access_token|secret|api_?key)=[^&\s]+")
 
@@ -530,7 +530,7 @@ def probe_lines(group):
                      "did not move through the step that holds them; "
                      "PROJ skips a missing optional grid "
                      "without a warning" % ascii_text(
-                         ", ".join(group["optional"])))
+                         redact(", ".join(group["optional"]))))
     if not better:
         if group["verdict"] == NULL_SHIFT and not group.get("optional"):
             lines.append("  no more accurate operation is known to PROJ here; "
@@ -1652,6 +1652,15 @@ def _self_test(tmp, user_dir):
           and "a grid cannot fix" not in out,
           "a proj4 NAD27 definition whose optional grids are missing does not "
           "move the point and exits 1  <-- pinned defect")
+    for secret in ("hunter2", "pa?ss"):
+        code, out, err = run_cli(
+            ["--from", "+proj=longlat +datum=NAD27 +nadgrids=@http://user:%s"
+             "@127.0.0.1:9/conus.gsb +no_defs" % secret, "--to", "EPSG:4326",
+             "--point", "-82", "29"])
+        check(code == 1 and "optional grid(s)" in out
+              and secret not in out + err and "http://***@127.0.0.1" in out,
+              "a credential in an optional grid URL is not echoed in the "
+              "report body (%s)  <-- pinned defect" % secret.replace("?", "q"))
     # a later step that moves the point must not hide the skipped grid
     classic = ("+proj=longlat +ellps=clrk66 +nadgrids=@conus,@alaska,"
                "@ntv2_0.gsb,@ntv1_can.dat +no_defs")
@@ -2039,6 +2048,11 @@ def _self_test(tmp, user_dir):
           and redact("EPSG:4326") == "EPSG:4326",
           "redact hides a user:password that holds an @ and leaves a plain "
           "code alone")
+    check(redact("http://user:pa?ss@h/x") == "http://***@h/x"
+          and redact("http://user:pa#ss@h/x") == "http://***@h/x"
+          and redact("http://h/x?a=b@c") == "http://h/x?a=b@c",
+          "redact hides a password that holds ? or #, and leaves an @ "
+          "after the host alone  <-- pinned defect")
     check(run_cli(base + ["--control", os.path.join(tmp, "absent.csv")])[0]
           == 2, "a control file that does not exist exits 2")
     bad = write("bad.csv", "sx,sy,tx,ty\n1,2,3\n")
