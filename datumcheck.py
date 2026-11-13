@@ -464,14 +464,20 @@ def collect_points(explicit, control, emit):
             + [(r[0], r[1]) for r in emit])
 
 
-_USERINFO = re.compile(r"(://)[^/\s]*@")
+_USERINFO = re.compile(
+    r'(://)(?:[^/\s@:]*:[^\s"]*|[^/\s]*)@')
+_SECRET_WORDS = (r"password|passwd|pwd|token|secret|api[-_]?key|key|sig|"
+                 r"signature|auth")
 _SECRET_PARAM = re.compile(
-    r"(?i)\b(password|passwd|pwd|token|access_token|secret|api_?key)=[^&\s]+")
+    r"(?i)([\w.-]*(?:%s)[\w.-]*)=[^&\s]+" % _SECRET_WORDS)
 
 
 def redact(text):
     """Hide URL user:password and secret-looking query values. CRS text from
-    --from and --to can be a URL, and the tool echoes it into logs."""
+    --from and --to can be a URL, and the tool echoes it into logs. A name
+    that holds a secret word hides its value, so db_password and authToken
+    are hidden as well as password. A user:password with a slash in the
+    password is hidden up to the last @ of the word."""
     text = _USERINFO.sub(r"\1***@", str(text))
     return _SECRET_PARAM.sub(r"\1=***", text)
 
@@ -520,10 +526,14 @@ def group_probes(results):
 
 def probe_lines(group):
     """The report lines for one group of probes."""
+    verdict = group["verdict"]
+    if verdict == OK and group.get("unchecked"):
+        verdict = "OK (position not checked)"
     lines = ["%s  %d probe(s), first at %r, %r" % (
-        group["verdict"], group["count"], group["x"], group["y"]),
+        verdict, group["count"], group["x"], group["y"]),
         "  PROJ used  %s (declared accuracy %s)" % (
-            ascii_text(group["desc"]), accuracy_text(group["accuracy"]))]
+            ascii_text(redact(group["desc"])),
+            accuracy_text(group["accuracy"]))]
     better = better_missing(group["accuracy"], group["missing"])
     if group.get("optional") and group["verdict"] == NULL_SHIFT:
         lines.append("  the CRS names the optional grid(s) %s and the point "
@@ -580,8 +590,8 @@ def _import_pyproj():
             "pyproj %s with PROJ %s is too old. datumcheck needs pyproj "
             "%d.%d and PROJ %d.%d or newer. PROJ 9.2 adds the NADCON5 "
             "operations; without them the report would say that no grid can "
-            "fix a pair that a grid does fix. pyproj 3.5 is the first "
-            "release built on PROJ 9.2." % (
+            "fix a pair that a grid does fix. pyproj 3.5.0 reports PROJ "
+            "9.2.0 and pyproj 3.4.0 reports 9.1.0." % (
                 (have_pyproj, have_proj) + MIN_PYPROJ + MIN_PROJ))
     return pyproj
 
@@ -777,6 +787,27 @@ def refuse_defaulted_ballpark(res):
                 res["x"], res["y"], ascii_text(res["desc"])))
 
 
+def refuse_missing_grids(crs):
+    """Raise ValueError when a CRS names a grid that this host does not hold.
+
+    A proj4 string such as +nadgrids=name.gsb on a CRS whose ellipsoid already
+    matches the hub can be dropped by PROJ without a warning, so the run would
+    report a clean pass for a datum step that never ran. An optional grid
+    (name starts with @) is judged by the probe itself, and "null" is PROJ's
+    own zero grid, which no file holds."""
+    operation = crs.coordinate_operation
+    missing = [] if operation is None else [
+        grid.short_name for grid in operation.grids
+        if not grid.available and not grid.short_name.startswith("@")
+        and grid.short_name != "null"]
+    if missing:
+        raise ValueError(
+            "the CRS names the grid(s) %s and this host does not hold them. "
+            "PROJ can drop such a step without a warning, so the verdict "
+            "would be a false clean. Install the grid with projsync, or use "
+            "an EPSG code." % ", ".join(missing))
+
+
 def run_check(args, out):
     """Run the whole check. Returns the exit code; writes the report to out."""
     pyproj = _import_pyproj()
@@ -786,6 +817,8 @@ def run_check(args, out):
     except pyproj.exceptions.CRSError as exc:
         raise ValueError("cannot read a CRS: %s" % exc)
     src, dst = horizontal(src), horizontal(dst)
+    refuse_missing_grids(src)
+    refuse_missing_grids(dst)
     tf = pyproj.Transformer.from_crs(src, dst, always_xy=True)
     ctx = {"src": src, "dst": dst, "tf": tf,
            "bounds": area_bounds(pyproj, src),
@@ -1862,6 +1895,10 @@ def _self_test(tmp, user_dir):
           "checked (exit 0)" in out,
           "two CRS with no area of use warn that the position was not "
           "checked and do not claim a plain OK  <-- pinned defect")
+    check("OK (position not checked)  1 probe(s)" in out
+          and "OK  1 probe(s)" not in out,
+          "the verdict line of an unchecked probe says the position was not "
+          "checked, not a bare OK  <-- pinned defect")
     code, out, err = run_cli(["--from", "EPSG:4326", "--to", "EPSG:4979",
                               "--point", "-82.0", "29.2"])
     check("not checked" not in out,
@@ -2053,6 +2090,56 @@ def _self_test(tmp, user_dir):
           and redact("http://h/x?a=b@c") == "http://h/x?a=b@c",
           "redact hides a password that holds ? or #, and leaves an @ "
           "after the host alone  <-- pinned defect")
+    check(all("SECRET" not in redact(text) for text in (
+        "db_password=SECRET", "x?authToken=SECRET", "x?api-key=SECRET",
+        "x?client_secret=SECRET&key=SECRET", "x?sig=SECRET",
+        "https://user:SE/CRET@host/x", "https://TOKEN-SECRET@host/x"))
+          and redact("x?datum=WGS84&units=m") == "x?datum=WGS84&units=m",
+          "redact hides a value whose name only ends in a secret word, and "
+          "a user:password whose password holds a slash  <-- pinned defect")
+    code, out, err = run_cli(["--from", "EPSG:4269", "--to",
+                              "https://grids.invalid/x.gsb?client_secret="
+                              "CSECRET456&key=KEYVAL789", "--point", "-82",
+                              "29"])
+    check(code == 2 and "CSECRET456" not in err + out
+          and "KEYVAL789" not in err + out,
+          "client_secret and key values in a CRS URL are not echoed in the "
+          "CRS error  <-- pinned defect")
+    code, out, err = run_cli(["--from", "EPSG:4269", "--to",
+                              "+proj=longlat +datum=NAD83 +no_defs "
+                              "+sig=SASTOKEN123", "--point", "-82", "29"])
+    check(code == 0 and "SASTOKEN123" not in out + err,
+          "a +sig value in a valid CRS string is not echoed in the report "
+          "header  <-- pinned defect")
+    named = ('GEOGCS["https://u:SECRETN@h.invalid/x",DATUM["https://u:'
+             'SECRETD@h.invalid/d",SPHEROID["Clarke_1866",6378206.4,'
+             '294.9786982]],PRIMEM["Greenwich",0],UNIT["Degree",'
+             '0.0174532925199433]]')
+    code, out, err = run_cli(["--from", named, "--to", "EPSG:4269",
+                              "--point", "-82", "29"])
+    check(code == 1 and "PROJ used" in out and "SECRETN" not in out + err
+          and "SECRETD" not in out + err,
+          "a credential in a CRS or datum name is not echoed on the PROJ "
+          "used line  <-- pinned defect")
+    def fake_crs(*grids):
+        listed = [types.SimpleNamespace(short_name=name, available=have)
+                  for name, have in grids]
+        return types.SimpleNamespace(
+            coordinate_operation=types.SimpleNamespace(grids=listed))
+
+    refuse_missing_grids(fake_crs(("null", False), ("@conus", False),
+                                  ("held.gsb", True)))
+    refuse_missing_grids(types.SimpleNamespace(coordinate_operation=None))
+    raises(lambda: refuse_missing_grids(fake_crs(("null", False),
+                                                 ("lost.gsb", False))),
+           "a CRS grid that is neither null, optional nor held is refused  "
+           "<-- pinned defect")
+    code, out, err = run_cli(["--from", "+proj=longlat +nadgrids="
+                              "nosuchfile.gsb", "--to", "EPSG:4326",
+                              "--point", "-82", "29"])
+    check(code == 2 and "nosuchfile.gsb" in err and "RESULT" not in out,
+          "a CRS that names a required grid this host lacks exits 2, not a "
+          "clean 0 from a dropped datum step  <-- pinned defect")
     check(run_cli(base + ["--control", os.path.join(tmp, "absent.csv")])[0]
           == 2, "a control file that does not exist exits 2")
     bad = write("bad.csv", "sx,sy,tx,ty\n1,2,3\n")

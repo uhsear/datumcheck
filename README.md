@@ -3,9 +3,9 @@
 Exit non-zero when PROJ moves your data with a null-shift operation. Report the error in US survey
 feet and in acres.
 
-A nightly job on a Linux server reprojects a parcel layer from NAD83 to NAD83(2011) State Plane.
+Picture a nightly job on a Linux server. It reprojects a parcel layer from NAD83 to NAD83(2011) State Plane.
 The Python there came from `pip install pyproj`. The job logs no warning and exits 0. The output
-looks right on a map.
+looks right on a map. The story is an illustration, not a report of a real incident.
 
 It is not right. The pip wheel carries no datum grids, so PROJ cannot use the operation that
 needs one. It falls back to a zero translation, or to a "ballpark" offset that moves nothing.
@@ -47,6 +47,8 @@ PASS  a default probe that falls offshore on a ballpark offset exits 2 and asks 
 PASS  Oahu alone is degraded, Nihoa alone is clean, and the pair exits 3 in either order  <-- pinned defect
 ...
 PASS  a proj4 NAD27 definition whose optional grids are missing does not move the point and exits 1  <-- pinned defect
+PASS  a credential in an optional grid URL is not echoed in the report body (hunter2)  <-- pinned defect
+...
 PASS  a skipped optional grid is found when the target step moves the point, source side  <-- pinned defect
 ...
 PASS  a control file 30 ft east and 40 ft north reports a 50.00 ftUS miss and 0.3078 acres
@@ -56,17 +58,19 @@ PASS  a control miss of 50 ft over --max-miss 10 exits 4, not 0  <-- pinned defe
 PASS  a probe outside the area of use of the source CRS exits 2  <-- pinned defect
 ...
 PASS  a latitude-first --point from EPSG:4326 to EPSG:4267 exits 2, not a false NULL SHIFT  <-- pinned defect
-PASS  a credential in --from URL text is not echoed in the CRS error  <-- pinned defect
-PASS  a credential in an optional grid URL is not echoed in the report body (hunter2)  <-- pinned defect
+...
 PASS  a longitude written east of 180 that wraps into the area of use is probed, not refused  <-- pinned defect
 ...
 PASS  an ESRI .prj source refuses a northing-first and a lon/lat point like its EPSG twin, not a false exit 0  <-- pinned defect
+...
 PASS  the default probe of NAD83 to NAD83(2011) lies in the CONUS NADCON5 area, not offshore  <-- pinned defect
 ...
 PASS  a host without the grids refuses to emit control values and writes nothing  <-- pinned defect
 ...
+PASS  a credential in --from URL text is not echoed in the CRS error  <-- pinned defect
+...
 --------------------------------------------------------------------
-210 assertions, 0 failed
+217 assertions, 0 failed
 ```
 
 ## What already exists
@@ -136,9 +140,8 @@ both versions when either is older, or when `pyproj` reports no version. `--self
 the same stack and also needs pyproj, because half of it runs real PROJ.
 
 The floor is not arbitrary. The PROJ 9.2.0 release notes list "Added support for NADCON5 grids and
-transformation method" and the `ONLY_BEST` option. pyproj 3.5.0 is the first release that reports PROJ
-9.2 (the 3.5.0 wheel reports PROJ 9.2.0, the 3.4.0 wheel PROJ 9.1.0), measured from the version strings,
-not from the pyproj release notes. On pyproj 3.4.0 with PROJ 9.1.0 and no grids, version d25c27e of this tool checked
+transformation method" and the `ONLY_BEST` option. The 3.5.0 wheel reports PROJ 9.2.0 and the 3.4.0 wheel reports PROJ 9.1.0, measured from the version
+strings, not from the pyproj release notes. On pyproj 3.4.0 with PROJ 9.1.0 and no grids, version d25c27e of this tool checked
 `--from EPSG:2236 --to EPSG:6438 --point 600000 1200000`, exited 1 and printed "no more accurate
 operation is known to PROJ here; a grid cannot fix this pair". That sentence is false: four NADCON5
 grids fix the pair, and the Windows host with those grids reports `OK` for it. The exit code was
@@ -153,11 +156,11 @@ Tested on:
 
 | Host | Python | pyproj | PROJ | Self-test |
 |---|---|---|---|---|
-| Windows 11 | 3.13.2 (venv) | 3.8.0 | 9.8.1 | 210 assertions, 0 failed |
-| Windows 11 | 3.13.2 (`C:\Python313`) | 3.7.2 | 9.5.1 | 210 assertions, 0 failed |
-| Linux (Ubuntu) | 3.12.3 (venv) | 3.8.0 | 9.8.1 | 210 assertions, 0 failed |
-| Linux (Ubuntu) | 3.9.25 (venv) | 3.6.1 | 9.3.0 | 210 assertions, 0 failed |
-| Linux (Ubuntu) | 3.9.25 (venv) | 3.5.0 | 9.2.0 | 210 assertions, 0 failed |
+| Windows 11 | 3.13.2 (venv) | 3.8.0 | 9.8.1 | 217 assertions, 0 failed |
+| Windows 11 | 3.13.2 (`C:\Python313`) | 3.7.2 | 9.5.1 | 217 assertions, 0 failed |
+| Linux (Ubuntu) | 3.12.3 (venv) | 3.8.0 | 9.8.1 | 217 assertions, 0 failed |
+| Linux (Ubuntu) | 3.9.25 (venv) | 3.6.1 | 9.3.0 | 217 assertions, 0 failed |
+| Linux (Ubuntu) | 3.9.25 (venv) | 3.5.0 | 9.2.0 | 217 assertions, 0 failed |
 | Linux (Ubuntu) | 3.9.25 (venv) | 3.4.0 | 9.1.0 | refused, exit 2; the check refuses too |
 | Linux (Ubuntu) | 3.9.25 (venv) | 3.4.1 | 9.1.0 | refused, exit 2, the same as 3.4.0 |
 
@@ -175,7 +178,7 @@ python datumcheck.py --from EPSG:2236 --to EPSG:6438 --point 600000 1200000
 
 ## Usage
 
-The check writes no file, and nothing in this tool changes your data, so there is no `--apply`.
+The check writes no file of its own, and nothing in this tool changes your data, so there is no `--apply`.
 Two things write, and both are outside that rule on purpose. `--self-test` makes a fresh
 temporary directory with CSV fixtures and empty PROJ user directories, and removes it when it
 ends, even if an assertion raises. A self-test killed with SIGKILL leaves the directory behind.
@@ -317,8 +320,9 @@ An ESRI `.prj` (WKT1) or a proj4 string has no area of use of its own. When PROJ
 an EPSG CRS (`CRS.to_epsg()`, default confidence 70), that CRS lends its area, so a `.prj` of
 `EPSG:26717` refuses a northing-first point like `--from EPSG:26717` does. A source that stays
 unidentified is checked against the area of the target. When neither CRS gives a bounded area, the
-position is not checked: the report prints a note, and an otherwise clean result reads `RESULT: no
-null shift found at a probe whose position was not checked (exit 0)`. The exit code is still 0.
+position is not checked: the report prints a note, the verdict line reads `OK (position not checked)`,
+and an otherwise clean result reads `RESULT: no null shift found at a probe whose position was not
+checked (exit 0)`. The exit code is still 0.
 
 ## Error in feet and acres
 
@@ -603,21 +607,33 @@ area-of-use refusal now rejects those points with exit 2.
 - Control and point files are echoed in errors. A header problem prints the first
   line of the file, and a bad cell prints the cell. Do not point `--control` or `--emit-control` at
   a file that holds secrets, and keep CI logs of an exit 2 private.
-- The tool redacts the user name and password in a URL (`scheme://user:password@host`) and the value
-  of a `password`, `passwd`, `pwd`, `token`, `access_token`, `secret` or `apikey` query parameter
-  in the `--from` and `--to` text before it prints that text in the report header, in the optional-grid line of the report, in the CRS
-  error and in an exit 70 message and traceback. Measured with
+- The tool redacts the user name and password in a URL (`scheme://user:password@host`, also when the
+  password holds `/`, `?` or `#`), and the value of any query or proj4 parameter whose name holds
+  `password`, `passwd`, `pwd`, `token`, `secret`, `apikey`, `api-key`, `key`, `sig`, `signature` or
+  `auth`, so `db_password`, `authToken`, `client_secret` and `+sig=` are hidden. It does this in
+  the `--from` and `--to` text before it prints that text in the report header and the CRS
+  error, in the optional-grid line, on the `PROJ used` line (PROJ builds that name from the CRS and
+  datum names) and in an exit 70 message and traceback. Measured with
   `--from https://user:SECRET@host.invalid/x`: the exit 2 message shows `https://***@host.invalid/x`.
-  The tool does not know other secret formats, so never pass CRS text that holds credentials.
-  Control and point file cells are not redacted (see the bullet above).
-- The tool redacts only the exact query names `password`, `passwd`, `pwd`, `token`, `access_token`,
-  `secret` and `apikey`. Values of `client_secret`, `refresh_token`, `key` and `sig` are printed.
-  Only `scheme://user:password@host` is redacted. A bare `user:password@host` is echoed, and a
-  password may hold `?` or `#`. Usage errors (exit 64) print the offending argument as typed,
-  for example `--parcel-acres SECRET` prints `invalid float value: 'SECRET'`. Never pass CRS text
-  or arguments that hold a credential.
+  A bare `user:password@host` with no `://` is echoed, and so is a secret under a name that holds
+  none of those words. Usage errors (exit 64) print the offending argument as typed, for example
+  `--parcel-acres SECRET` prints `invalid float value: 'SECRET'`. Never pass CRS text or arguments
+  that hold a credential. Control and point file cells are not redacted (see the bullet above).
 - Read the exit code, not the report text. The report echoes CRS text, which can span several
   lines, so a CRS that holds a `RESULT:` line can imitate the verdict line.
+- With no `--point`, the default probe is a guess about where your data lives, and the verdict
+  describes that place. Measured with no grids on the host, `--from EPSG:5070 --to EPSG:4326` exits 1
+  at a probe in the Quebec and Maine area and names `ca_nrc_NA83SCRS.tif`, a Canadian grid. Always
+  pass `--point` in a gating job.
+- The `RESULT` line speaks about null shifts only. Measured with `--from EPSG:2237 --to
+  EPSG:2883` and a control row `600000,1200000,1,1`: the control line shows a miss of 2765993.09
+  ftUS and the run still ends `RESULT: no null shift found (exit 0)`. Read the control line, or
+  pass `--max-miss`, before you trust a control file.
+- A control file must be comma separated. Measured with a semicolon file: exit 2, "the header lacks
+  column sx, sy, tx, ty; it has sx;sy;tx;ty".
+- Run datumcheck only under Python 3.9 or newer. I did not run an older interpreter. One may fail
+  before the tool starts and exit 1, which is also the code of a null-shift finding. Python 3.9 was
+  exercised on Linux only (3.9.25), not on Windows.
 - A control file alone never fails the run. Pass `--max-miss` in any gate.
 - `--self-test` exits 1 when an assertion fails, the same code as a null shift. A CI step that runs
   `--self-test` and a gating step must be separate steps.
@@ -626,10 +642,11 @@ area-of-use refusal now rejects those points with exit 2.
   `EPSG:2236` and `--to EPSG:6438` and no `--point`: exit 2, "a CRS has no area of use; pass
   --point". Pass `--point` with such a source.
 - A proj4 string on the WGS 84 ellipsoid that names a required grid file, taken to `EPSG:4326`, is
-  treated by PROJ as already in WGS 84, so a missing grid is not reported. Measured with
-  `--from "+proj=longlat +nadgrids=nosuchfile.gsb" --to EPSG:4326 --point -82 29`: exit 0 with
-  "position was not checked". The same string with `+ellps=clrk66` or `+datum=NAD27` exits 2. Use
-  an EPSG code.
+  treated by PROJ as already in WGS 84, so PROJ drops the grid without a warning. The tool asks the
+  CRS for its grids and exits 2 when a required one (a name with no `@`) is not on the host.
+  Measured with `--from "+proj=longlat +nadgrids=nosuchfile.gsb" --to EPSG:4326 --point -82 29`:
+  exit 2, "the CRS names the grid(s) nosuchfile.gsb and this host does not hold them". An
+  optional `@name` grid is judged by the probe, as in the bullets above.
 - A control row with longitude and latitude swapped is refused when the source or target CRS has a
   bounded area, such as `EPSG:4269` or `EPSG:2236`. With world-wide CRS it is scored. Measured with
   `--from EPSG:4326 --to EPSG:3857` and the row `29,-82,-82,29`: worst miss 56,667,252 ftUS, exit 0
@@ -640,7 +657,8 @@ area-of-use refusal now rejects those points with exit 2.
   `--from EPSG:4267 --to EPSG:4269`: south 7.15 gives a verdict and 7.14 exits 2. The self-test
   does not pin the boundary, and a mutant of `in_area` that uses `<` instead of `<=` would pass.
 - With no bounded area on either side, a latitude-first point is not refused and the verdict is
-  marked "position was not checked". Measured with two `+proj=longlat +ellps=GRS80 +no_defs`
+  marked "position was not checked", and the verdict line reads `OK (position not checked)`.
+  Measured with two `+proj=longlat +ellps=GRS80 +no_defs`
   strings at `--point 29.2 -82`: exit 0. A gate that must catch a latitude-first point should use
   EPSG codes.
 - A rectangular area-of-use box can refuse a legitimate point just outside a CRS's published box,
@@ -659,12 +677,12 @@ area-of-use refusal now rejects those points with exit 2.
   missing operation. A pair could exit 0 on a known-accuracy fallback while such a grid is
   missing. I searched 310 geographic CRS pairs with `TransformerGroup` and found no real case.
 - The system `python3` on the Linux host has no pyproj, so `python3 datumcheck.py --self-test` there
-  exits 2 and prints no PASS lines. The 210 assertion result needs a virtual environment with pyproj.
+  exits 2 and prints no PASS lines. The 217 assertion result needs a virtual environment with pyproj.
 - Branch coverage is 100 percent on both hosts, from `coverage run --branch datumcheck.py
-  --self-test`: 1002 statements and 186 branches on the Windows venv (coverage 7.16.1) and the same
-  1002 and 186 on Linux (coverage 7.17.0 in the `dcvenv` venv and 7.17.2 in a second venv),
+  --self-test`: 1030 statements and 190 branches on the Windows venv (coverage 7.16.1) and the same
+  1030 and 190 on Linux (coverage 7.17.0 in the `dcvenv` venv),
   with none missed or partly covered. No line is excluded.
-  The network lines run against the loopback stub. All hosts run the same 210 assertions, because
+  The network lines run against the loopback stub. All hosts run the same 217 assertions, because
   the real PROJ part runs on every host with the grids hidden.
 
 ## Sources checked
